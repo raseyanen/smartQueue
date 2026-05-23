@@ -1,6 +1,5 @@
 #include "database.h"
-
-// Определение глобальной БД — в main.cpp (extern в config.h)
+#include "logger.h"
 
 void db_init() {
     g_db.begin();
@@ -20,4 +19,6 @@ void db_init() {
     g_db.init(K_BT_MAC,       DEFAULT_PRINTER_MAC);
     g_db.init(K_WEB_PASS,     "");
     g_db.init(K_CONFIGURED,   (uint8_t)0);
+
+    LOGI("DB", "Database ready, %d keys", g_db.length());
 }

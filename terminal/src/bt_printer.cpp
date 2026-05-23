@@ -1,6 +1,9 @@
 #include "bt_printer.h"
 #include "raster_font.h"
-#include <stdlib.h>  // calloc, free
+#include "logger.h"
+#include <stdlib.h>
+
+#define TAG "BT"
 
 #if BT_CLASSIC
     #include <BluetoothSerial.h>
@@ -12,38 +15,67 @@
 #endif
 
 // =============================================================================
-//  Низкоуровневая отправка
+//  Проверка живости соединения
 // =============================================================================
-void bt_write(const uint8_t* d, size_t n) {
-    if (!g_printerConnected || !d || n == 0) return;
-
+bool bt_is_alive() {
 #if BT_CLASSIC
-    if (!SerialBT.connected()) return;
-    for (size_t off = 0; off < n; off += SPP_CHUNK_SIZE) {
-        size_t chunk = min((size_t)SPP_CHUNK_SIZE, n - off);
-        SerialBT.write(d + off, chunk);
-        if (n - off > SPP_CHUNK_SIZE) delay(SPP_CHUNK_DELAY_MS);
-    }
+    return SerialBT.connected();
 #else
-    if (!pBleRxChar) return;
-    for (size_t off = 0; off < n; off += BLE_CHUNK_SIZE) {
-        size_t chunk = min((size_t)BLE_CHUNK_SIZE, n - off);
-        pBleRxChar->writeValue(d + off, chunk, true);
-        delay(BLE_CHUNK_DELAY_MS);
-    }
+    return (pBleClient != nullptr &&
+            pBleClient->isConnected() &&
+            pBleRxChar != nullptr);
 #endif
 }
 
 // =============================================================================
-//  Отправка растрового блока (протокол FunnyPrint / rastertozj.c)
-//
-//  Формат:
-//    1D 76 30 00   — Print Raster Bit Image
-//    wL wH         — ширина в байтах (little-endian)
-//    hL hH         — высота блока (little-endian)
-//    DATA          — h × w байт (MSB first, 1 = чёрный)
+//  Отправка данных
 // =============================================================================
-static void sendRasterBlock(const uint8_t* data, int widthBytes, int height) {
+bool bt_write(const uint8_t* d, size_t n) {
+    if (!g_printerConnected || !d || n == 0) {
+        LOGW(TAG, "write: not connected or empty data (n=%u)", n);
+        return false;
+    }
+
+    if (!bt_is_alive()) {
+        LOGE(TAG, "write: connection lost!");
+        g_printerConnected = false;
+        return false;
+    }
+
+#if BT_CLASSIC
+    for (size_t off = 0; off < n; off += SPP_CHUNK_SIZE) {
+        size_t chunk = min((size_t)SPP_CHUNK_SIZE, n - off);
+        size_t written = SerialBT.write(d + off, chunk);
+        if (written != chunk) {
+            LOGE(TAG, "SPP write error: sent %u/%u at offset %u",
+                 written, chunk, off);
+            return false;
+        }
+        if (n - off > SPP_CHUNK_SIZE) delay(SPP_CHUNK_DELAY_MS);
+    }
+    LOGD(TAG, "SPP wrote %u bytes OK", n);
+    return true;
+#else
+    for (size_t off = 0; off < n; off += BLE_CHUNK_SIZE) {
+        size_t chunk = min((size_t)BLE_CHUNK_SIZE, n - off);
+        if (!pBleRxChar->writeValue(d + off, chunk, true)) {
+            LOGE(TAG, "BLE write error at offset %u", off);
+            return false;
+        }
+        delay(BLE_CHUNK_DELAY_MS);
+    }
+    LOGD(TAG, "BLE wrote %u bytes OK", n);
+    return true;
+#endif
+}
+
+// =============================================================================
+//  Отправка растрового блока
+// =============================================================================
+static bool sendRasterBlock(const uint8_t* data, int widthBytes, int height) {
+    LOGD(TAG, "Raster block: %dx%d (%d bytes)",
+         widthBytes * 8, height, widthBytes * height);
+
     for (int y = 0; y < height; y += RASTER_BLOCK_HEIGHT) {
         int blockH = min(RASTER_BLOCK_HEIGHT, height - y);
 
@@ -54,154 +86,285 @@ static void sendRasterBlock(const uint8_t* data, int widthBytes, int height) {
             (uint8_t)(blockH & 0xFF),
             (uint8_t)((blockH >> 8) & 0xFF)
         };
-        bt_write(hdr, sizeof(hdr));
-        bt_write(data + y * widthBytes, blockH * widthBytes);
 
-        // Пауза на обработку принтером
-        delay(blockH / 4 + 10);
-    }
-}
+        LOGD(TAG, "Block y=%d h=%d hdr=[%02X %02X %02X %02X %02X %02X %02X %02X]",
+             y, blockH,
+             hdr[0],hdr[1],hdr[2],hdr[3],hdr[4],hdr[5],hdr[6],hdr[7]);
 
-// =============================================================================
-//  Bluetooth-подключение
-// =============================================================================
-#if BT_CLASSIC
-
-bool bt_connect() {
-    // Читаем MAC из БД
-    char macBuf[20];
-    {
-        // Копируем из GyverDB — она возвращает AnyValue
-        auto v = g_db[K_BT_MAC];
-        const char* s = v.toString().c_str();
-        size_t len = strlen(s);
-        if (len < 17) {
-            strncpy(macBuf, DEFAULT_PRINTER_MAC, sizeof(macBuf));
-        } else {
-            strncpy(macBuf, s, sizeof(macBuf));
+        if (!bt_write(hdr, sizeof(hdr))) {
+            LOGE(TAG, "Failed to send raster header");
+            return false;
         }
-        macBuf[sizeof(macBuf) - 1] = '\0';
-    }
-
-    uint8_t addr[6];
-    if (sscanf(macBuf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-               &addr[0], &addr[1], &addr[2], &addr[3], &addr[4], &addr[5]) != 6) {
-        Serial.println(F("[BT] Bad MAC"));
-        return false;
-    }
-
-    SerialBT.end();
-    delay(200);
-    if (!SerialBT.begin(BT_NAME_CLASSIC, true)) {
-        Serial.println(F("[BT] Init failed"));
-        return false;
-    }
-
-    bool ok = SerialBT.connect(addr);
-    g_printerConnected = ok;
-    if (ok) {
-        delay(200);
-        raster_init();
-        Serial.println(F("[BT] Connected (SPP)"));
-    } else {
-        Serial.println(F("[BT] Connect failed"));
-    }
-    return ok;
-}
-
-void bt_disconnect() {
-    SerialBT.disconnect();
-    g_printerConnected = false;
-    delay(200);
-}
-
-#else  // BLE (C3)
-
-class BtPrinterCallbacks : public NimBLEClientCallbacks {
-    void onDisconnect(NimBLEClient*) override {
-        g_printerConnected = false;
-        Serial.println(F("[BLE] Disconnected"));
-    }
-};
-
-bool bt_connect() {
-    char macBuf[20];
-    {
-        auto v = g_db[K_BT_MAC];
-        const char* s = v.toString().c_str();
-        size_t len = strlen(s);
-        if (len < 17) {
-            strncpy(macBuf, DEFAULT_PRINTER_MAC, sizeof(macBuf));
-        } else {
-            strncpy(macBuf, s, sizeof(macBuf));
+        if (!bt_write(data + y * widthBytes, blockH * widthBytes)) {
+            LOGE(TAG, "Failed to send raster data block y=%d", y);
+            return false;
         }
-        macBuf[sizeof(macBuf) - 1] = '\0';
+
+        // Даём принтеру обработать
+        int waitMs = blockH * 2 + 20;
+        LOGD(TAG, "Wait %d ms for printer", waitMs);
+        delay(waitMs);
     }
-
-    NimBLEDevice::init(BT_NAME_BLE);
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
-    pBleClient = NimBLEDevice::createClient();
-    static BtPrinterCallbacks cbk;
-    pBleClient->setClientCallbacks(&cbk, false);
-
-    // PUBLIC → RANDOM fallback
-    bool ok = pBleClient->connect(NimBLEAddress(macBuf, BLE_ADDR_PUBLIC));
-    if (!ok) {
-        Serial.println(F("[BLE] PUBLIC failed, trying RANDOM..."));
-        ok = pBleClient->connect(NimBLEAddress(macBuf, BLE_ADDR_RANDOM));
-    }
-    if (!ok) {
-        Serial.println(F("[BLE] Connect failed"));
-        return false;
-    }
-
-    pBleClient->setMTU(512);
-
-    auto* svc = pBleClient->getService(NUS_SVC_UUID);
-    if (!svc) {
-        pBleClient->disconnect();
-        Serial.println(F("[BLE] No NUS service"));
-        return false;
-    }
-    pBleRxChar = svc->getCharacteristic(NUS_RX_UUID);
-    if (!pBleRxChar) {
-        pBleClient->disconnect();
-        Serial.println(F("[BLE] No RX char"));
-        return false;
-    }
-
-    g_printerConnected = true;
-    delay(200);
-    raster_init();
-    Serial.println(F("[BLE] Connected (NUS)"));
     return true;
 }
 
+// =============================================================================
+//  Подключение с retry и подробным логированием
+// =============================================================================
+
+// Вспомогательная: читаем MAC из БД
+static void readMac(char* macBuf, size_t sz) {
+    auto v = g_db[K_BT_MAC];
+    const char* s = v.toString().c_str();
+    if (strlen(s) < 17) {
+        strncpy(macBuf, DEFAULT_PRINTER_MAC, sz - 1);
+        LOGW(TAG, "MAC not set, using default %s", DEFAULT_PRINTER_MAC);
+    } else {
+        strncpy(macBuf, s, sz - 1);
+    }
+    macBuf[sz - 1] = '\0';
+}
+
+#if BT_CLASSIC
+// ─── Classic SPP ─────────────────────────────────────────────────────────────
+
+bool bt_connect() {
+    char macBuf[20];
+    readMac(macBuf, sizeof(macBuf));
+
+    uint8_t addr[6];
+    if (sscanf(macBuf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &addr[0],&addr[1],&addr[2],&addr[3],&addr[4],&addr[5]) != 6) {
+        LOGE(TAG, "Invalid MAC format: %s", macBuf);
+        return false;
+    }
+
+    LOGI(TAG, "Connecting SPP to %s ...", macBuf);
+
+    for (int attempt = 1; attempt <= BT_CONNECT_RETRIES; attempt++) {
+        LOGI(TAG, "Attempt %d/%d", attempt, BT_CONNECT_RETRIES);
+
+        SerialBT.end();
+        delay(300);
+
+        if (!SerialBT.begin(BT_NAME_CLASSIC, true)) {
+            LOGE(TAG, "SerialBT.begin() failed");
+            delay(BT_RETRY_DELAY_MS);
+            continue;
+        }
+        LOGD(TAG, "SerialBT initialized as master");
+
+        bool ok = SerialBT.connect(addr);
+        if (ok && SerialBT.connected()) {
+            g_printerConnected = true;
+            LOGI(TAG, "SPP connected on attempt %d!", attempt);
+
+            // Пауза для инициализации принтера
+            delay(500);
+            raster_init();
+            delay(200);
+
+            // Проверяем что соединение живое после init
+            if (bt_is_alive()) {
+                LOGI(TAG, "Printer ready");
+                return true;
+            } else {
+                LOGW(TAG, "Connection dropped after init");
+                g_printerConnected = false;
+            }
+        } else {
+            LOGW(TAG, "SPP connect failed (attempt %d)", attempt);
+        }
+
+        delay(BT_RETRY_DELAY_MS);
+    }
+
+    LOGE(TAG, "All %d SPP attempts failed", BT_CONNECT_RETRIES);
+    g_printerConnected = false;
+    return false;
+}
+
 void bt_disconnect() {
+    LOGI(TAG, "Disconnecting SPP...");
+    SerialBT.disconnect();
+    g_printerConnected = false;
+    delay(300);
+    LOGI(TAG, "Disconnected");
+}
+
+#else
+// ─── BLE NUS ─────────────────────────────────────────────────────────────────
+
+class BtPrinterCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* cli) override {
+        LOGI("BLE", "onConnect callback");
+    }
+    void onDisconnect(NimBLEClient* cli) override {
+        g_printerConnected = false;
+        LOGW("BLE", "onDisconnect callback (reason may be timeout or manual)");
+    }
+};
+
+static BtPrinterCallbacks bleCallbacks;
+
+bool bt_connect() {
+    char macBuf[20];
+    readMac(macBuf, sizeof(macBuf));
+
+    LOGI(TAG, "Connecting BLE to %s ...", macBuf);
+
+    for (int attempt = 1; attempt <= BT_CONNECT_RETRIES; attempt++) {
+        LOGI(TAG, "Attempt %d/%d", attempt, BT_CONNECT_RETRIES);
+
+        // Очистка предыдущего клиента
+        if (pBleClient) {
+            if (pBleClient->isConnected()) {
+                pBleClient->disconnect();
+                delay(200);
+            }
+            NimBLEDevice::deleteClient(pBleClient);
+            pBleClient = nullptr;
+            pBleRxChar = nullptr;
+        }
+
+        // (Re)init NimBLE
+        if (!NimBLEDevice::getInitialized()) {
+            NimBLEDevice::init(BT_NAME_BLE);
+            NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+            LOGD(TAG, "NimBLE initialized");
+        }
+
+        pBleClient = NimBLEDevice::createClient();
+        pBleClient->setClientCallbacks(&bleCallbacks, false);
+        pBleClient->setConnectTimeout(10);  // 10 секунд таймаут
+
+        LOGD(TAG, "Trying PUBLIC address...");
+        bool connected = pBleClient->connect(
+            NimBLEAddress(macBuf, BLE_ADDR_PUBLIC));
+
+        if (!connected) {
+            LOGD(TAG, "PUBLIC failed, trying RANDOM...");
+            connected = pBleClient->connect(
+                NimBLEAddress(macBuf, BLE_ADDR_RANDOM));
+        }
+
+        if (!connected) {
+            LOGW(TAG, "BLE connect failed (attempt %d)", attempt);
+            delay(BT_RETRY_DELAY_MS);
+            continue;
+        }
+
+        LOGI(TAG, "BLE link established");
+
+        // MTU negotiation
+        uint16_t mtu = pBleClient->getMTU();
+        LOGD(TAG, "Default MTU: %u", mtu);
+        // Не запрашиваем слишком большой MTU — может упасть
+        // pBleClient->setMTU(247);  // опционально
+        // mtu = pBleClient->getMTU();
+        // LOGD(TAG, "Negotiated MTU: %u", mtu);
+
+        // Поиск NUS сервиса
+        LOGD(TAG, "Looking for NUS service %s ...", NUS_SVC_UUID);
+        auto* svc = pBleClient->getService(NUS_SVC_UUID);
+        if (!svc) {
+            LOGE(TAG, "NUS service NOT FOUND");
+
+            // Перечисляем все сервисы для отладки
+            auto* svcs = pBleClient->getServices(true);
+            if (svcs) {
+                LOGD(TAG, "Available services (%d):", svcs->size());
+                for (auto& s : *svcs) {
+                    LOGD(TAG, "  SVC: %s", s->getUUID().toString().c_str());
+                }
+            }
+
+            pBleClient->disconnect();
+            delay(BT_RETRY_DELAY_MS);
+            continue;
+        }
+        LOGI(TAG, "NUS service found");
+
+        // Поиск RX характеристики
+        LOGD(TAG, "Looking for RX char %s ...", NUS_RX_UUID);
+        pBleRxChar = svc->getCharacteristic(NUS_RX_UUID);
+        if (!pBleRxChar) {
+            LOGE(TAG, "RX characteristic NOT FOUND");
+
+            // Перечисляем характеристики
+            auto chars = svc->getCharacteristics(true);
+            if (chars) {
+                for (auto& c : *chars) {
+                    LOGD(TAG, "  CHAR: %s props=0x%02X",
+                         c->getUUID().toString().c_str(),
+                         c->getProperties());
+                }
+            }
+
+            pBleClient->disconnect();
+            delay(BT_RETRY_DELAY_MS);
+            continue;
+        }
+
+        // Проверяем что характеристика поддерживает запись
+        uint32_t props = pBleRxChar->getProperties();
+        LOGD(TAG, "RX char found, props=0x%02X (Write=%d WriteNR=%d)",
+             props,
+             (props & NIMBLE_PROPERTY::WRITE) ? 1 : 0,
+             (props & NIMBLE_PROPERTY::WRITE_NR) ? 1 : 0);
+
+        g_printerConnected = true;
+        LOGI(TAG, "BLE connected on attempt %d!", attempt);
+
+        delay(500);
+        raster_init();
+        delay(200);
+
+        if (bt_is_alive()) {
+            LOGI(TAG, "Printer ready (BLE)");
+            return true;
+        } else {
+            LOGW(TAG, "Connection dropped after init");
+            g_printerConnected = false;
+        }
+
+        delay(BT_RETRY_DELAY_MS);
+    }
+
+    LOGE(TAG, "All %d BLE attempts failed", BT_CONNECT_RETRIES);
+    g_printerConnected = false;
+    return false;
+}
+
+void bt_disconnect() {
+    LOGI(TAG, "Disconnecting BLE...");
     if (pBleClient && pBleClient->isConnected()) {
         pBleClient->disconnect();
     }
+    pBleRxChar = nullptr;
     g_printerConnected = false;
-    delay(200);
+    delay(300);
+    LOGI(TAG, "Disconnected");
 }
 
 #endif
 
 // =============================================================================
-//  Примитивы растровой печати
+//  Растровые примитивы
 // =============================================================================
 
 void raster_init() {
     if (!g_printerConnected) return;
-    const uint8_t cmd[] = {0x1B, 0x40};   // ESC @
+    LOGD(TAG, "Sending ESC @ (init)");
+    const uint8_t cmd[] = {0x1B, 0x40};
     bt_write(cmd, 2);
-    delay(50);
+    delay(100);  // увеличено для надёжности
 }
 
 void raster_feed(uint8_t lines) {
     if (!g_printerConnected) return;
-    const uint8_t cmd[] = {0x1B, 0x64, lines};  // ESC d n
+    LOGD(TAG, "Feed %d lines", lines);
+    const uint8_t cmd[] = {0x1B, 0x64, lines};
     bt_write(cmd, 3);
 }
 
@@ -209,28 +372,32 @@ void raster_empty(int heightPx) {
     if (!g_printerConnected || heightPx <= 0) return;
     size_t sz = (size_t)PRINTER_WIDTH_BYTES * heightPx;
     uint8_t* buf = (uint8_t*)calloc(sz, 1);
-    if (!buf) return;
+    if (!buf) {
+        LOGE(TAG, "OOM empty %d px", heightPx);
+        return;
+    }
     sendRasterBlock(buf, PRINTER_WIDTH_BYTES, heightPx);
     free(buf);
 }
 
 void raster_separator(char style, uint8_t heightPx) {
     if (!g_printerConnected) return;
+    LOGD(TAG, "Separator style='%c' h=%d", style, heightPx);
+
     size_t sz = (size_t)PRINTER_WIDTH_BYTES * heightPx;
     uint8_t* buf = (uint8_t*)calloc(sz, 1);
-    if (!buf) return;
+    if (!buf) { LOGE(TAG, "OOM sep"); return; }
 
     for (int y = 0; y < heightPx; y++) {
         for (int x = 0; x < PRINTER_WIDTH_PX; x++) {
             bool on = false;
             switch (style) {
-                case '-': on = ((x / 4) % 2 == 0);                   break;
-                case '=': on = (y == 0 || y == heightPx - 1);        break;
-                default:  on = true;                                  break;
+                case '-': on = ((x / 4) % 2 == 0);              break;
+                case '=': on = (y == 0 || y == heightPx - 1);   break;
+                default:  on = true;                             break;
             }
             if (on) {
-                int bi = y * PRINTER_WIDTH_BYTES + (x >> 3);
-                buf[bi] |= (0x80 >> (x & 7));
+                buf[y * PRINTER_WIDTH_BYTES + (x >> 3)] |= (0x80 >> (x & 7));
             }
         }
     }
@@ -254,7 +421,6 @@ void raster_print_line(const char* text, uint8_t scale,
     const int maxChars = PRINTER_WIDTH_PX / charW;
     if (textLen > maxChars) textLen = maxChars;
 
-    // Смещение для выравнивания
     int textPx  = textLen * charW;
     int offsetX = 0;
     if (align == 1) offsetX = (PRINTER_WIDTH_PX - textPx) / 2;
@@ -264,7 +430,13 @@ void raster_print_line(const char* text, uint8_t scale,
     const int height = charH;
     size_t rasterSz  = (size_t)PRINTER_WIDTH_BYTES * height;
     uint8_t* raster  = (uint8_t*)calloc(rasterSz, 1);
-    if (!raster) { Serial.println(F("[Raster] OOM")); return; }
+    if (!raster) {
+        LOGE(TAG, "OOM raster %d bytes", rasterSz);
+        return;
+    }
+
+    LOGD(TAG, "Render: \"%.*s\" scale=%d align=%d bold=%d offset=%d",
+         textLen, text, scale, align, bold, offsetX);
 
     for (int ci = 0; ci < textLen; ci++) {
         const uint8_t* glyph = fontGlyph(text[ci]);
@@ -282,16 +454,20 @@ void raster_print_line(const char* text, uint8_t scale,
                         int py = row * scale + sy;
                         if (px < 0 || px >= PRINTER_WIDTH_PX || py >= height)
                             continue;
-                        int bi = py * PRINTER_WIDTH_BYTES + (px >> 3);
-                        raster[bi] |= (0x80 >> (px & 7));
+                        raster[py * PRINTER_WIDTH_BYTES + (px >> 3)]
+                            |= (0x80 >> (px & 7));
                     }
                 }
             }
         }
     }
 
-    sendRasterBlock(raster, PRINTER_WIDTH_BYTES, height);
+    bool ok = sendRasterBlock(raster, PRINTER_WIDTH_BYTES, height);
     free(raster);
+
+    if (!ok) {
+        LOGE(TAG, "Print line FAILED");
+    }
 }
 
 // =============================================================================
@@ -299,39 +475,53 @@ void raster_print_line(const char* text, uint8_t scale,
 // =============================================================================
 void printTicket(const char* num, const char* queue, const char* eta) {
     if (!g_printerConnected) {
-        Serial.println(F("[Printer] not connected"));
+        LOGE("PRN", "Cannot print: not connected");
         return;
     }
-    Serial.printf("[Printer] Ticket %s\n", num);
+    if (!bt_is_alive()) {
+        LOGE("PRN", "Cannot print: connection dead");
+        g_printerConnected = false;
+        return;
+    }
+
+    LOGI("PRN", "=== Printing ticket: %s ===", num);
+    LOGI("PRN", "  Queue: %s", queue);
+    LOGI("PRN", "  ETA:   %s", (eta && eta[0]) ? eta : "(none)");
 
     raster_init();
-    delay(100);
+    delay(150);
 
-    // Заголовок 2x, центр, жирный
+    LOGI("PRN", "Step 1/7: Header");
     raster_print_line("SMART QUEUE", 2, 1, true);
-    raster_empty(4);
+    raster_empty(6);
 
+    LOGI("PRN", "Step 2/7: Separator");
     raster_separator('-', 2);
-    raster_empty(4);
+    raster_empty(6);
 
-    // Очередь 1x, центр
+    LOGI("PRN", "Step 3/7: Queue name");
     raster_print_line(queue, 1, 1, false);
-    raster_empty(4);
+    raster_empty(6);
 
-    // Номер 2x, центр, жирный
+    LOGI("PRN", "Step 4/7: Ticket number");
     raster_print_line(num, 2, 1, true);
-    raster_empty(4);
+    raster_empty(6);
 
-    // Ожидание
     if (eta && eta[0]) {
+        LOGI("PRN", "Step 5/7: ETA");
         char waitBuf[64];
         snprintf(waitBuf, sizeof(waitBuf), "Wait: %s", eta);
         raster_print_line(waitBuf, 1, 0, false);
-        raster_empty(4);
+        raster_empty(6);
+    } else {
+        LOGD("PRN", "Step 5/7: ETA skipped");
     }
 
+    LOGI("PRN", "Step 6/7: Bottom separator");
     raster_separator('-', 2);
+
+    LOGI("PRN", "Step 7/7: Feed");
     raster_feed(4);
 
-    Serial.printf("[Printer] Ticket %s OK\n", num);
+    LOGI("PRN", "=== Ticket %s printed OK ===", num);
 }

@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- *  main.cpp — SmartQueue Terminal v2.1 (FunnyPrint Raster)
+ *  SmartQueue Terminal v2.2 — FunnyPrint Raster + Logging
  * ============================================================================
  */
 
@@ -12,22 +12,20 @@
 #include <SettingsESP.h>
 
 #include "config.h"
+#include "logger.h"
 #include "database.h"
 #include "wifi_manager.h"
 #include "bt_printer.h"
 #include "api_client.h"
 #include "web_ui.h"
 
-// =============================================================================
-//  Глобальные объекты (extern в config.h)
-// =============================================================================
+// ── Глобалы ──────────────────────────────────────────────────────────────────
 GyverDBFile g_db(&LittleFS, "/sq_config.db");
 SettingsESP sett("SmartQueue Terminal", &g_db);
 
 bool g_wifiConnected    = false;
 bool g_printerConnected = false;
 
-// Bluetooth объекты (extern в bt_printer.cpp)
 #if BT_CLASSIC
     #include <BluetoothSerial.h>
     BluetoothSerial SerialBT;
@@ -37,97 +35,130 @@ bool g_printerConnected = false;
     NimBLERemoteCharacteristic*  pBleRxChar = nullptr;
 #endif
 
-static unsigned long lastPoll = 0;
+static unsigned long lastPoll    = 0;
+static unsigned long lastBtCheck = 0;
+#define BT_CHECK_INTERVAL_MS  10000UL
 
-// =============================================================================
-//  SETUP
+static void checkBtConnection() {
+    if (!g_printerConnected) return;
+    if (!bt_is_alive()) {
+        LOGW("MAIN", "Printer connection lost");
+        g_printerConnected = false;
+    }
+}
+
 // =============================================================================
 void setup() {
     Serial.begin(115200);
     delay(400);
 
-    Serial.println(F("\n=== SmartQueue Terminal v2.1 (FunnyPrint Raster) ==="));
+    // 1. Логирование — ПЕРВЫМ
+    log_init();
+    LOGI("MAIN", "=== SmartQueue Terminal v%s ===", FW_VERSION);
 #if BT_CLASSIC
-    Serial.println(F("Board: WROOM-32  BT: Classic SPP"));
+    LOGI("MAIN", "Board: WROOM-32 (Classic SPP)");
 #else
-    Serial.println(F("Board: C3  BT: BLE NUS"));
+    LOGI("MAIN", "Board: C3 (BLE NUS)");
 #endif
-    Serial.printf("Printer width: %d px\n", PRINTER_WIDTH_PX);
+    LOGI("MAIN", "Raster width: %d px", PRINTER_WIDTH_PX);
+    LOGI("MAIN", "Free heap: %u", ESP.getFreeHeap());
 
-    // 1. Файловая система
+    // 2. LittleFS
     if (!LittleFS.begin(true)) {
-        Serial.println(F("[FS] LittleFS FAIL"));
+        LOGE("MAIN", "LittleFS FAIL");
+    } else {
+        LOGI("MAIN", "LittleFS OK");
     }
 
-    // 2. БД
+    // 3. БД
     db_init();
 
-    // 3. Веб-интерфейс
+    // 4. Settings callbacks
     sett.onBuild(ui_build);
     sett.onUpdate(ui_update);
 
-    // Пароль из БД
+    // Пароль
     {
         char pw[64] = {0};
         auto v = g_db[K_WEB_PASS];
         strncpy(pw, v.toString().c_str(), sizeof(pw)-1);
-        if (pw[0]) sett.setPass(pw);
+        if (pw[0]) {
+            sett.setPass(pw);
+            LOGD("MAIN", "Web password restored");
+        }
     }
 
-    // 4. WiFi
+    // 5. WiFi
     bool configured = (bool)g_db[K_CONFIGURED].toInt();
     char ssidTest[4] = {0};
     { auto v = g_db[K_SSID]; strncpy(ssidTest, v.toString().c_str(), 3); }
 
     if (!configured || !ssidTest[0]) {
-        Serial.println(F("[Setup] AP mode"));
+        LOGI("MAIN", "No config / no SSID -> AP mode");
         wifi_start_ap();
     } else {
         wifi_connect();
         if (!g_wifiConnected) {
-            Serial.println(F("[Setup] WiFi fail -> AP"));
+            LOGW("MAIN", "WiFi failed -> AP fallback");
             wifi_start_ap();
         }
     }
 
-    // 5. Settings begin (HTTP + WS)
+    // 6. Settings begin (HTTP server start)
     sett.begin();
 
+    // 7. Регистрируем эндпоинты логов ПОСЛЕ sett.begin()
+    ui_register_log_endpoint();
+
     if (g_wifiConnected) {
-        Serial.printf("[HTTP] http://%s\n", WiFi.localIP().toString().c_str());
+        LOGI("MAIN", "Web UI: http://%s", WiFi.localIP().toString().c_str());
+        LOGI("MAIN", "Full log: http://%s/log", WiFi.localIP().toString().c_str());
     } else {
-        Serial.printf("[HTTP] http://%s\n", WiFi.softAPIP().toString().c_str());
+        LOGI("MAIN", "Web UI: http://%s", WiFi.softAPIP().toString().c_str());
+        LOGI("MAIN", "Full log: http://%s/log", WiFi.softAPIP().toString().c_str());
     }
 
-    // 6. Принтер
+    // 8. Принтер
     if (configured) {
-        bt_connect();
-        if (g_printerConnected) {
-            raster_print_line("SmartQueue v2.1", 1, 1, true);
-            raster_print_line("FunnyPrint Raster", 1, 1, false);
-            raster_print_line("Ready", 1, 1, false);
+        LOGI("MAIN", "Connecting printer...");
+        bool btOk = bt_connect();
+        if (btOk && g_printerConnected) {
+            LOGI("MAIN", "Printing startup banner");
+            raster_print_line("SmartQueue v2.2", 1, 1, true);
+            raster_print_line("Raster Ready", 1, 1, false);
             raster_feed(2);
+            LOGI("MAIN", "Banner printed OK");
+        } else {
+            LOGW("MAIN", "Printer not available at startup");
         }
+    } else {
+        LOGI("MAIN", "Not configured, skipping printer");
     }
 
-    // 7. Флаг configured
+    // 9. configured flag
     if (!configured && ssidTest[0]) {
         g_db[K_CONFIGURED] = (uint8_t)1;
+        LOGD("MAIN", "Marked as configured");
     }
 
-    Serial.println(F("[Setup] Done"));
+    LOGI("MAIN", "Setup complete. Heap: %u", ESP.getFreeHeap());
 }
 
-// =============================================================================
-//  LOOP
 // =============================================================================
 void loop() {
     sett.server.handleClient();
     sett.tick();
 
+    // API polling
     if (g_wifiConnected && millis() - lastPoll >= POLL_INTERVAL_MS) {
         lastPoll = millis();
         api_poll();
+    }
+
+    // BT health check
+    if (millis() - lastBtCheck >= BT_CHECK_INTERVAL_MS) {
+        lastBtCheck = millis();
+        checkBtConnection();
     }
 
     yield();
