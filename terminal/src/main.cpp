@@ -1,5 +1,6 @@
 /*
- * SmartQueue Terminal - ESP32-WROOM-32
+ * SmartQueue Terminal - ESP32 (WROOM-32 / C3)
+ * Uses: Settings, GyverPortal, FileData, GyverNTP
  */
 
 #include <Arduino.h>
@@ -13,33 +14,43 @@
 #include <GyverButton.h>
 #include <GSON.h>
 #include <mString.h>
+#include <GyverPortal.h>
+#include <Settings.h>
+#include <FileData.h>
+#include <GyverNTP.h>
 
-#define VERSION "1.0.0"
-// Pin configuration for ESP32-WROOM-32
-#define DEFAULT_BTN_PIN 15      // GPIO 15
-#define DEFAULT_LED_PIN 2       // GPIO 2 (built-in LED on most boards)
-#define DEFAULT_OLED_SDA 21     // GPIO 21 (I2C SDA)
-#define DEFAULT_OLED_SCL 22     // GPIO 22 (I2C SCL)
-#define PRINTER_RX 16           // GPIO 16 (Bluetooth not used for printer on WROOM)
-#define PRINTER_TX 17           // GPIO 17
+#define VERSION "2.0.0"
+// Pin configuration
+#define DEFAULT_BTN_PIN 15
+#define DEFAULT_LED_PIN 2
+#define DEFAULT_OLED_SDA 21
+#define DEFAULT_OLED_SCL 22
+#define PRINTER_RX 16
+#define PRINTER_TX 17
 
 GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
 GyverButton btn(DEFAULT_BTN_PIN);
 WebServer server(80);
+GyverNTP ntp;
+
+// Settings builder
+Settings settings("SmartQueue", "admin");
+
+// Data storage using FileData
+FileData fd("/smartqueue.dat");
 
 struct Config {
-    mString ssid = "";
-    mString password = "";
-    mString serverUrl = "http://192.168.1.100:8000";
-    mString terminalHash = "";
-    mString queueLink = "";
-    mString webPassword = "admin";
+    char ssid[32] = "";
+    char password[64] = "";
+    char serverUrl[64] = "http://192.168.1.100:8000";
+    char terminalHash[32] = "";
+    char queueLink[64] = "";
+    char webPassword[32] = "admin";
     uint8_t btnPin = DEFAULT_BTN_PIN;
     uint8_t ledPin = DEFAULT_LED_PIN;
     uint8_t oledSda = DEFAULT_OLED_SDA;
     uint8_t oledScl = DEFAULT_OLED_SCL;
     bool oledEnabled = true;
-    bool configured = false;
 } config;
 
 uint8_t macAddress[6];
@@ -47,6 +58,8 @@ bool isApMode = false;
 bool ticketPending = false;
 int pendingTicketNumber = 0;
 int pendingTicketId = 0;
+unsigned long lastNtpSync = 0;
+char currentTime[32] = "";
 
 void oledInit() {
     if (!config.oledEnabled) return;
@@ -111,25 +124,86 @@ mString generateHashFromMac() {
     return result;
 }
 
+void loadConfigFromFile() {
+    if (!fd.begin()) {
+        Serial.println("FileData init failed");
+        return;
+    }
+    fd.get("ssid", config.ssid, sizeof(config.ssid));
+    fd.get("password", config.password, sizeof(config.password));
+    fd.get("serverUrl", config.serverUrl, sizeof(config.serverUrl));
+    fd.get("terminalHash", config.terminalHash, sizeof(config.terminalHash));
+    fd.get("queueLink", config.queueLink, sizeof(config.queueLink));
+    fd.get("webPassword", config.webPassword, sizeof(config.webPassword));
+    config.btnPin = fd.getInt("btnPin", DEFAULT_BTN_PIN);
+    config.ledPin = fd.getInt("ledPin", DEFAULT_LED_PIN);
+    config.oledSda = fd.getInt("oledSda", DEFAULT_OLED_SDA);
+    config.oledScl = fd.getInt("oledScl", DEFAULT_OLED_SCL);
+    config.oledEnabled = fd.getBool("oledEnabled", true);
+    Serial.println("Config loaded from FileData");
+}
+
+void saveConfigToFile() {
+    if (!fd.begin()) {
+        Serial.println("FileData init failed");
+        return;
+    }
+    fd.put("ssid", config.ssid);
+    fd.put("password", config.password);
+    fd.put("serverUrl", config.serverUrl);
+    fd.put("terminalHash", config.terminalHash);
+    fd.put("queueLink", config.queueLink);
+    fd.put("webPassword", config.webPassword);
+    fd.putInt("btnPin", config.btnPin);
+    fd.putInt("ledPin", config.ledPin);
+    fd.putInt("oledSda", config.oledSda);
+    fd.putInt("oledScl", config.oledScl);
+    fd.putBool("oledEnabled", config.oledEnabled);
+    Serial.println("Config saved to FileData");
+}
+
+void setupSettings() {
+    settings.setAuth(config.webPassword);
+    
+    settings.begin("WiFi Settings");
+    settings.text("ssid", "WiFi SSID", config.ssid, sizeof(config.ssid));
+    settings.text("password", "WiFi Password", config.password, sizeof(config.password), "", true);
+    settings.end();
+    
+    settings.begin("Server Settings");
+    settings.text("serverUrl", "Server URL", config.serverUrl, sizeof(config.serverUrl));
+    settings.text("queueLink", "Queue Link", config.queueLink, sizeof(config.queueLink));
+    settings.end();
+    
+    settings.begin("Hardware");
+    settings.number("btnPin", "Button Pin", config.btnPin, 0, 40);
+    settings.number("ledPin", "LED Pin", config.ledPin, 0, 40);
+    settings.number("oledSda", "OLED SDA", config.oledSda, 0, 40);
+    settings.number("oledScl", "OLED SCL", config.oledScl, 0, 40);
+    settings.checkbox("oledEnabled", "Enable OLED", config.oledEnabled);
+    settings.end();
+    
+    settings.onSave([]() {
+        saveConfigToFile();
+        delay(1000);
+        ESP.restart();
+    });
+}
+
 void connectToWifi();
 void startApMode();
 bool printerConnect();
 bool printerPrintTicket(int number, const char* type, const char* queueName, const char* hash);
 int getTicketFromServer();
 bool confirmPrintOnServer();
-String sendHeader();
-void handleRoot();
-void handleSave();
-void handleUpdate();
-void handleNotFound();
-bool loadConfig();
-void saveConfig();
+void updateTime();
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== SmartQueue Terminal ===");
     Serial.println("Version: " + String(VERSION));
+    
     getMacAddress();
     Serial.print("MAC: ");
     for (int i = 0; i < 6; i++) {
@@ -138,20 +212,33 @@ void setup() {
         if (i < 5) Serial.print(":");
     }
     Serial.println();
-    if (!loadConfig() || !config.configured) {
-        Serial.println("First run or config missing - starting AP mode");
-        config.terminalHash = generateHashFromMac();
-        saveConfig();
+    
+    // Load config from FileData
+    loadConfigFromFile();
+    
+    // Generate hash if empty
+    if (strlen(config.terminalHash) == 0) {
+        mString hash = generateHashFromMac();
+        strncpy(config.terminalHash, hash.c_str(), sizeof(config.terminalHash) - 1);
+        saveConfigToFile();
     }
+    
     pinMode(config.ledPin, OUTPUT);
     pinMode(config.btnPin, INPUT_PULLUP);
     btn.setType(TYPE_HIGH);
     oledInit();
+    
+    // Setup Settings web interface
+    setupSettings();
+    
     connectToWifi();
-    server.on("/", handleRoot);
-    server.on("/save", HTTP_POST, handleSave);
-    server.on("/update", HTTP_POST, [](){ server.send(200, "text/plain", "Update complete. Rebooting..."); delay(1000); ESP.restart(); }, handleUpdate);
-    server.onNotFound(handleNotFound);
+    
+    // Start NTP sync if connected
+    if (WiFi.status() == WL_CONNECTED) {
+        ntp.begin();
+        updateTime();
+    }
+    
     server.begin();
     Serial.println("HTTP server started");
     printerConnect();
@@ -161,6 +248,16 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    settings.tick();  // Handle Settings web interface
+    
+    // Sync NTP every hour
+    if (millis() - lastNtpSync > 3600000UL) {
+        if (ntp.tick()) {
+            updateTime();
+            lastNtpSync = millis();
+        }
+    }
+    
     btn.tick();
     if (btn.isClick()) {
         if (ticketPending) {
@@ -182,9 +279,7 @@ void loop() {
                 ticketPending = true;
                 oledShowTicket(pendingTicketNumber, "T");
                 ledBlink(5, 100);
-                mString hash = config.terminalHash;
-                mString queueName = config.queueLink;
-                if (printerPrintTicket(pendingTicketNumber, "T", queueName.c_str(), hash.c_str()))
+                if (printerPrintTicket(pendingTicketNumber, "T", config.queueLink, config.terminalHash))
                     oledShowStatus("Printed - Press to confirm");
             } else {
                 oledShowStatus("Get ticket failed");
@@ -286,91 +381,13 @@ bool confirmPrintOnServer() {
     http.end(); return false;
 }
 
-String sendHeader() {
-    String header = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>SmartQueue Terminal</title><style>";
-    header += "body{font-family:Arial;margin:20px;background:#f5f5f5;}.card{background:white;padding:20px;margin:10px 0;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}";
-    header += "input,select{width:100%;padding:10px;margin:5px 0;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;}button{background:#007bff;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;}button:hover{background:#0056b3;}";
-    header += ".status{padding:10px;background:#e7f3ff;border-radius:4px;margin:10px 0;}.preview{background:#f8f9fa;padding:15px;border:1px dashed #ccc;font-family:monospace;white-space:pre-wrap;}</style></head><body>";
-    return header;
-}
-
-void handleRoot() {
-    String html = sendHeader();
-    html += "<div class='card'><h2>SmartQueue Terminal</h2><div class='status'><strong>Status:</strong> ";
-    if (isApMode) html += "<span style='color:orange'>AP Mode</span>";
-    else if (WiFi.status() == WL_CONNECTED) html += "<span style='color:green'>Connected</span> - IP: " + WiFi.localIP().toString();
-    else html += "<span style='color:red'>Disconnected</span>";
-    html += "<br><strong>MAC:</strong> ";
-    for (int i = 0; i < 6; i++) { if (macAddress[i] < 0x10) html += "0"; html += String(macAddress[i], HEX); if (i < 5) html += ":"; }
-    html += "<br><strong>Hash:</strong> " + String(config.terminalHash) + "<br><strong>Firmware:</strong> " + String(VERSION) + "</div></div>";
-    html += "<div class='card'><h3>Configuration</h3><form method='POST' action='/save'>";
-    html += "<label>WiFi SSID:</label><input type='text' name='ssid' value='" + String(config.ssid.c_str()) + "'>";
-    html += "<label>WiFi Password:</label><input type='password' name='password' value='" + String(config.password.c_str()) + "'>";
-    html += "<label>Server URL:</label><input type='text' name='serverUrl' value='" + String(config.serverUrl.c_str()) + "'>";
-    html += "<label>Queue Link:</label><input type='text' name='queueLink' value='" + String(config.queueLink.c_str()) + "'>";
-    html += "<label>Web Password:</label><input type='password' name='webPassword' value='" + String(config.webPassword.c_str()) + "'>";
-    html += "<label>Button Pin:</label><input type='number' name='btnPin' value='" + String(config.btnPin) + "'>";
-    html += "<label>LED Pin:</label><input type='number' name='ledPin' value='" + String(config.ledPin) + "'>";
-    html += "<label>OLED SDA:</label><input type='number' name='oledSda' value='" + String(config.oledSda) + "'>";
-    html += "<label>OLED SCL:</label><input type='number' name='oledScl' value='" + String(config.oledScl) + "'>";
-    html += "<label><input type='checkbox' name='oledEnabled' " + String(config.oledEnabled ? "checked" : "") + "> Enable OLED</label>";
-    html += "<button type='submit'>Save & Reboot</button></form></div>";
-    html += "<div class='card'><h3>Ticket Preview</h3><div class='preview'>SMARTQUEUE\\n----------------\\nQueue: " + String(config.queueLink.c_str()) + "\\nTALON: T[NUMBER]\\nDate: " + String(__DATE__) + " " + String(__TIME__) + "\\nHash: [HASH]\\n----------------\\n[QR CODE]\\n</div></div>";
-    html += "<div class='card'><h3>OTA Update</h3><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin'><button type='submit'>Upload & Update</button></form></div></body></html>";
-    server.send(200, "text/html", html);
-}
-
-void handleSave() {
-    if (server.hasArg("ssid")) config.ssid = server.arg("ssid").c_str();
-    if (server.hasArg("password")) config.password = server.arg("password").c_str();
-    if (server.hasArg("serverUrl")) config.serverUrl = server.arg("serverUrl").c_str();
-    if (server.hasArg("queueLink")) config.queueLink = server.arg("queueLink").c_str();
-    if (server.hasArg("webPassword")) config.webPassword = server.arg("webPassword").c_str();
-    if (server.hasArg("btnPin")) config.btnPin = server.arg("btnPin").toInt();
-    if (server.hasArg("ledPin")) config.ledPin = server.arg("ledPin").toInt();
-    if (server.hasArg("oledSda")) config.oledSda = server.arg("oledSda").toInt();
-    if (server.hasArg("oledScl")) config.oledScl = server.arg("oledScl").toInt();
-    config.oledEnabled = server.hasArg("oledEnabled"); config.configured = true;
-    saveConfig();
-    String html = sendHeader() + "<div class='card'><h3>Saved!</h3><p>Configuration saved. Rebooting...</p><script>setTimeout(function(){window.location.href='/';},2000);</script></div></body></html>";
-    server.send(200, "text/html", html); delay(1000); ESP.restart();
-}
-
-void handleUpdate() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) { Serial.printf("Update: %s\n", upload.filename.c_str()); if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial); }
-    else if (upload.status == UPLOAD_FILE_WRITE) { if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial); }
-    else if (upload.status == UPLOAD_FILE_END) { if (Update.end(true)) Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize); else Update.printError(Serial); }
-}
-
-void handleNotFound() { server.send(404, "text/plain", "Not Found"); }
-
-bool loadConfig() {
-    if (!LittleFS.begin()) { Serial.println("LittleFS mount failed"); return false; }
-    File file = LittleFS.open("/config.txt", "r"); if (!file) { Serial.println("Config file not found"); return false; }
-    mString line;
-    while (file.available()) {
-        line = file.readStringUntil('\n').c_str(); int eqPos = line.indexOf('=');
-        if (eqPos > 0) {
-            mString key = line.substring(0, eqPos); mString value = line.substring(eqPos + 1);
-            if (key == "ssid") config.ssid = value; else if (key == "password") config.password = value;
-            else if (key == "serverUrl") config.serverUrl = value; else if (key == "queueLink") config.queueLink = value;
-            else if (key == "webPassword") config.webPassword = value; else if (key == "btnPin") config.btnPin = value.toInt();
-            else if (key == "ledPin") config.ledPin = value.toInt(); else if (key == "oledSda") config.oledSda = value.toInt();
-            else if (key == "oledScl") config.oledScl = value.toInt(); else if (key == "oledEnabled") config.oledEnabled = value == "1";
-            else if (key == "terminalHash") config.terminalHash = value; else if (key == "configured") config.configured = value == "1";
-        }
+void updateTime() {
+    if (ntp.valid()) {
+        snprintf(currentTime, sizeof(currentTime), "%02d:%02d:%02d %02d.%02d.%04d",
+            ntp.hour(), ntp.minute(), ntp.second(),
+            ntp.day(), ntp.month(), ntp.year());
+        Serial.printf("NTP Time: %s\n", currentTime);
+    } else {
+        strcpy(currentTime, "No NTP sync");
     }
-    file.close(); return true;
-}
-
-void saveConfig() {
-    File file = LittleFS.open("/config.txt", "w"); if (!file) { Serial.println("Failed to open config for writing"); return; }
-    file.println("ssid=" + String(config.ssid.c_str())); file.println("password=" + String(config.password.c_str()));
-    file.println("serverUrl=" + String(config.serverUrl.c_str())); file.println("queueLink=" + String(config.queueLink.c_str()));
-    file.println("webPassword=" + String(config.webPassword.c_str())); file.println("btnPin=" + String(config.btnPin));
-    file.println("ledPin=" + String(config.ledPin)); file.println("oledSda=" + String(config.oledSda));
-    file.println("oledScl=" + String(config.oledScl)); file.println("oledEnabled=" + String(config.oledEnabled ? "1" : "0"));
-    file.println("terminalHash=" + String(config.terminalHash.c_str())); file.println("configured=" + String(config.configured ? "1" : "0"));
-    file.close(); Serial.println("Config saved");
 }
