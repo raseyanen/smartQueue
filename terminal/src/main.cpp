@@ -33,10 +33,23 @@ static unsigned long lastPoll    = 0;
 static unsigned long lastBtCheck = 0;
 #define BT_CHECK_INTERVAL_MS  15000UL
 
+// Буфер для IP — чтобы не использовать временный String в printf
+static char ipBuf[20];
+
+static void updateIpBuf() {
+    if (g_wifiConnected) {
+        IPAddress ip = WiFi.localIP();
+        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    } else {
+        IPAddress ip = WiFi.softAPIP();
+        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    }
+}
+
 static void checkBtConnection() {
     if (!g_printerConnected) return;
     if (!bt_is_alive()) {
-        LOGW("MAIN", "Printer connection lost");
+        LOGW("MAIN", "Printer link lost");
         g_printerConnected = false;
     }
 }
@@ -46,27 +59,23 @@ void setup() {
     Serial.begin(115200);
     delay(400);
 
-    // 1. Логирование
     log_init();
-    LOGI("MAIN", "=== SmartQueue Terminal v%s ===", FW_VERSION);
+    LOGI("MAIN", "=== SmartQueue v%s ===", FW_VERSION);
 #if BT_CLASSIC
-    LOGI("MAIN", "Board: WROOM-32 (Classic SPP)");
+    LOGI("MAIN", "WROOM-32 (SPP)");
 #else
-    LOGI("MAIN", "Board: C3 (BLE NUS)");
+    LOGI("MAIN", "C3 (BLE NUS)");
 #endif
     LOGI("MAIN", "Heap: %u", ESP.getFreeHeap());
 
-    // 2. LittleFS
     if (!LittleFS.begin(true)) {
         LOGE("MAIN", "LittleFS FAIL");
     } else {
         LOGI("MAIN", "LittleFS OK");
     }
 
-    // 3. БД
     db_init();
 
-    // 4. Settings
     sett.onBuild(ui_build);
     sett.onUpdate(ui_update);
 
@@ -77,44 +86,47 @@ void setup() {
         if (pw[0]) sett.setPass(pw);
     }
 
-    // 5. WiFi
+    // WiFi
     bool configured = (bool)g_db[K_CONFIGURED].toInt();
     char ssidTest[4] = {0};
     { auto v = g_db[K_SSID]; strncpy(ssidTest, v.toString().c_str(), 3); }
 
     if (!configured || !ssidTest[0]) {
-        LOGI("MAIN", "AP mode (not configured)");
+        LOGI("MAIN", "AP mode");
         wifi_start_ap();
     } else {
         wifi_connect();
         if (!g_wifiConnected) {
-            LOGW("MAIN", "WiFi fail -> AP fallback");
+            LOGW("MAIN", "WiFi fail -> AP");
             wifi_start_ap();
         }
     }
 
-    // 6. Settings begin
+    // Settings HTTP
     sett.begin();
 
-    // 7. Логи — ПОСЛЕ sett.begin()
+    // 404 handler — убирает спам "request handler not found"
+    sett.server.onNotFound([]() {
+        sett.server.send(404, "text/plain", "Not Found");
+    });
+
+    // Лог-эндпоинты
     ui_register_log_endpoint();
 
-    const char* ip = g_wifiConnected
-        ? WiFi.localIP().toString().c_str()
-        : WiFi.softAPIP().toString().c_str();
-    LOGI("MAIN", "Web: http://%s", ip);
-    LOGI("MAIN", "Log: http://%s/log", ip);
+    // IP
+    updateIpBuf();
+    LOGI("MAIN", "Web: http://%s", ipBuf);
+    LOGI("MAIN", "Log: http://%s/log", ipBuf);
 
-    // 8. Принтер — только если configured и MAC не дефолтный
+    // Принтер
     if (configured) {
         char macCheck[20] = {0};
         { auto v = g_db[K_BT_MAC]; strncpy(macCheck, v.toString().c_str(), 19); }
 
         if (strcmp(macCheck, DEFAULT_PRINTER_MAC) == 0 || strlen(macCheck) < 17) {
-            LOGW("MAIN", "Printer MAC is default — skipping auto-connect");
-            LOGW("MAIN", "Set correct MAC in web UI first");
+            LOGW("MAIN", "MAC is default, skip printer");
         } else {
-            LOGI("MAIN", "Auto-connecting printer %s ...", macCheck);
+            LOGI("MAIN", "Connecting printer %s", macCheck);
             bt_connect();
             if (g_printerConnected) {
                 raster_print_line("SmartQueue v2.2", 1, 1, true);
@@ -124,7 +136,6 @@ void setup() {
         }
     }
 
-    // 9. configured flag
     if (!configured && ssidTest[0]) {
         g_db[K_CONFIGURED] = (uint8_t)1;
     }
