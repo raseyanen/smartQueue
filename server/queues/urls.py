@@ -8,10 +8,6 @@ urlpatterns = [
     path('', views.queue_list, name='queue_list'),
     path('create/', views.queue_create, name='queue_create'),
 
-    # Проверка талона по хешу (ДО <str:link>/)
-    path('verify/', views.verify_ticket_form, name='verify_ticket_form'),
-    path('verify/result/', views.verify_ticket_result, name='verify_ticket_result'),
-    
     # Терминалы
     path('terminals/register/', views.terminal_register, name='terminal_register'),
     path('terminals/', views.terminal_list, name='terminal_list'),
