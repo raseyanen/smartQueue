@@ -1,42 +1,30 @@
 #pragma once
-/**
- * ============================================================================
- *  config.h — константы, ключи БД, определения плат
- * ============================================================================
- */
-
 #include <Arduino.h>
 #include <GyverDBFile.h>
 
-// ─── Версия ──────────────────────────────────────────────────────────────────
 #define FW_VERSION  "2.2.0"
 
-// ─── Принтер FunnyPrint ─────────────────────────────────────────────────────
+// ─── Принтер ─────────────────────────────────────────────────────────────────
 #define PRINTER_WIDTH_PX      384
 #define PRINTER_WIDTH_BYTES   48
 #define BLE_CHUNK_SIZE        20
-#define BLE_CHUNK_DELAY_MS    12     // увеличено для стабильности
-#define SPP_CHUNK_SIZE        256    // уменьшено для надёжности
-#define SPP_CHUNK_DELAY_MS    5
-#define RASTER_BLOCK_HEIGHT   64     // уменьшено: меньше блок = стабильнее
-#define BT_CONNECT_RETRIES    3      // попытки подключения
-#define BT_RETRY_DELAY_MS     1000
+#define BLE_CHUNK_DELAY_MS    15      // консервативно
+#define SPP_CHUNK_SIZE        128     // маленькие блоки для стабильности
+#define SPP_CHUNK_DELAY_MS    10
+#define RASTER_BLOCK_HEIGHT   32      // ещё меньше — надёжнее
+#define BT_CONNECT_RETRIES    2       // 2 попытки (3 = долго и может крашить)
+#define BT_RETRY_DELAY_MS     2000    // 2 секунды между попытками
 
-// ─── MAC по умолчанию ───────────────────────────────────────────────────────
+// ─── Дефолты ─────────────────────────────────────────────────────────────────
 static const char DEFAULT_PRINTER_MAC[] = "AA:BB:CC:DD:EE:FF";
-
-// ─── Интервал опроса ─────────────────────────────────────────────────────────
 #define POLL_INTERVAL_MS  5000UL
 
-// ─── AP ──────────────────────────────────────────────────────────────────────
 static const char AP_SSID[] = "SmartQueue-Setup";
 static const char AP_PASS[] = "12345678";
 
-// ─── BT имена ───────────────────────────────────────────────────────────────
 static const char BT_NAME_CLASSIC[] = "SmartQueue";
 static const char BT_NAME_BLE[]     = "SmartQueue-C3";
 
-// ─── BLE NUS UUID ────────────────────────────────────────────────────────────
 static const char NUS_SVC_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char NUS_RX_UUID[]  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 
