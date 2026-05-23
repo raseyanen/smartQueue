@@ -1,393 +1,671 @@
-/*
- * SmartQueue Terminal - ESP32 (WROOM-32 / C3)
- * Uses: Settings, GyverPortal, FileData, GyverNTP
+/**
+ * ============================================================================
+ *  SmartQueue Terminal  v2
+ * ============================================================================
+ *  Веб-интерфейс настроек через GyverLibs/Settings (правильный API v1.x):
+ *    • WiFi: Personal (WPA/WPA2-PSK) + Enterprise (PEAP/TTLS/EAP-TLS)
+ *    • API-сервер: URL, UUID очереди, API-токен + HMAC-секрет для подписи
+ *    • Bluetooth-принтер FunnyPrint LX-D02: MAC-адрес
+ *    • OTA: встроенное в Settings (файловый менеджер + загрузка прошивки)
+ *    • Авторизация веб-интерфейса паролем (гостевой/админ режим)
+ *    • Динамические метки статуса (IP, BT, Uptime)
+ *
+ *  Платы:
+ *    esp32_wroom       → Bluetooth Classic SPP  (BluetoothSerial)
+ *    esp32c3_supermini → BLE Nordic UART Service (NimBLE)
+ * ============================================================================
  */
 
 #include <Arduino.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <HTTPClient.h>
-#include <Update.h>
-#include <LittleFS.h>
-#include <Wire.h>
-#include <GyverOLED.h>
-#include <GyverButton.h>
-#include <GSON.h>
-#include <mString.h>
-#include <GyverPortal.h>
-#include <Settings.h>
-#include <FileData.h>
-#include <GyverNTP.h>
+#include <esp_wpa2.h>          // WPA2 Enterprise
+#include <esp_ota_ops.h>       // Версия прошивки из OTA-раздела
 
-#define VERSION "2.0.0"
-// Pin configuration
-#define DEFAULT_BTN_PIN 15
-#define DEFAULT_LED_PIN 2
-#define DEFAULT_OLED_SDA 21
-#define DEFAULT_OLED_SCL 22
-#define PRINTER_RX 16
-#define PRINTER_TX 17
+// GyverLibs
+#include <GyverDBFile.h>       // GyverDB + автосохранение в LittleFS
+#include <SettingsESP.h>       // Settings на стандартном esp-WebServer
 
-GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
-GyverButton btn(DEFAULT_BTN_PIN);
-WebServer server(80);
-GyverNTP ntp;
+// ─── Bluetooth ───────────────────────────────────────────────────────────────
+#if defined(BOARD_WROOM)
+    #include <BluetoothSerial.h>
+    #if !defined(CONFIG_BT_SPP_ENABLED)
+        #error "Classic BT SPP не включён"
+    #endif
+    BluetoothSerial SerialBT;
+    #define BT_CLASSIC 1
+#elif defined(BOARD_C3)
+    #include <NimBLEDevice.h>
+    #define NUS_SVC  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+    #define NUS_RX   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+    NimBLEClient*                pBleClient = nullptr;
+    NimBLERemoteCharacteristic*  pBleRxChar = nullptr;
+    #define BT_CLASSIC 0
+#else
+    #error "Укажите -D BOARD_WROOM или -D BOARD_C3 в platformio.ini"
+#endif
 
-// Settings builder
-Settings settings("SmartQueue", "admin");
+// ─── Версия прошивки ─────────────────────────────────────────────────────────
+#define FW_VERSION  "2.0.0"
 
-// Data storage using FileData
-FileData fd("/smartqueue.dat");
+// ─── MAC-адрес принтера по умолчанию (замените своим) ───────────────────────
+#define DEFAULT_PRINTER_MAC  "AA:BB:CC:DD:EE:FF"
 
-struct Config {
-    char ssid[32] = "";
-    char password[64] = "";
-    char serverUrl[64] = "http://192.168.1.100:8000";
-    char terminalHash[32] = "";
-    char queueLink[64] = "";
-    char webPassword[32] = "admin";
-    uint8_t btnPin = DEFAULT_BTN_PIN;
-    uint8_t ledPin = DEFAULT_LED_PIN;
-    uint8_t oledSda = DEFAULT_OLED_SDA;
-    uint8_t oledScl = DEFAULT_OLED_SCL;
-    bool oledEnabled = true;
-} config;
+// ─── Интервал опроса API-сервера ─────────────────────────────────────────────
+#define POLL_INTERVAL_MS  5000UL
 
-uint8_t macAddress[6];
-bool isApMode = false;
-bool ticketPending = false;
-int pendingTicketNumber = 0;
-int pendingTicketId = 0;
-unsigned long lastNtpSync = 0;
-char currentTime[32] = "";
+// =============================================================================
+//  Ключи GyverDB  (hash-литералы, экономим RAM)
+// =============================================================================
+// ── WiFi ─────────────────────────────────────────────────────────────────────
+#define K_WIFI_MODE      "wifi_mode"_h      // 0=PSK, 1=Enterprise
+#define K_SSID           "ssid"_h
+#define K_PSK            "psk"_h
+// Enterprise
+#define K_EAP_METHOD     "eap_method"_h     // 0=PEAP, 1=TTLS, 2=TLS
+#define K_EAP_IDENTITY   "eap_id"_h
+#define K_EAP_USER       "eap_user"_h
+#define K_EAP_PASS       "eap_pass"_h
+#define K_EAP_CA_CERT    "eap_ca"_h         // PEM-строка CA-сертификата (опц.)
+// ── API-сервер ────────────────────────────────────────────────────────────────
+#define K_API_URL        "api_url"_h        // http://host:port
+#define K_API_QUEUE      "api_queue"_h      // UUID очереди
+#define K_API_TOKEN      "api_token"_h      // Bearer-токен
+#define K_API_SECRET     "api_secret"_h     // HMAC-секрет для подписи запросов
+// ── Принтер ──────────────────────────────────────────────────────────────────
+#define K_BT_MAC         "bt_mac"_h
+// ── Веб-интерфейс ────────────────────────────────────────────────────────────
+#define K_WEB_PASS       "web_pass"_h       // Пароль веб-интерфейса
+// ── Служебный флаг ───────────────────────────────────────────────────────────
+#define K_CONFIGURED     "configured"_h
 
-void oledInit() {
-    if (!config.oledEnabled) return;
-    Wire.begin(config.oledSda, config.oledScl);
-    oled.init();
-    oled.clear();
-    oled.setCursor(0, 0);
-    oled.print("SmartQueue");
-    oled.setCursor(0, 20);
-    oled.print("Terminal v");
-    oled.print(VERSION);
-    oled.update();
-}
+// =============================================================================
+//  Глобальные объекты
+// =============================================================================
+// SettingsESP создаёт WebServer(80) внутри себя — не передаём свой
+GyverDBFile  db(&LittleFS, "/sq_config.db");
+SettingsESP  sett("SmartQueue Terminal", &db);
 
-void oledShowStatus(const char* status) {
-    if (!config.oledEnabled) return;
-    oled.clear();
-    oled.setCursor(0, 0);
-    oled.print("SmartQueue");
-    oled.setCursor(0, 20);
-    oled.print(status);
-    oled.update();
-}
+bool  wifiConnected    = false;
+bool  printerConnected = false;
+unsigned long lastPoll = 0;
 
-void oledShowTicket(int number, const char* type) {
-    if (!config.oledEnabled) return;
-    oled.clear();
-    oled.setCursor(0, 0);
-    oled.print("Talon: ");
-    oled.print(type);
-    oled.print(number);
-    oled.setCursor(0, 30);
-    oled.print("Press button");
-    oled.update();
-}
-
-void ledBlink(int times, int interval) {
-    for (int i = 0; i < times; i++) {
-        digitalWrite(config.ledPin, HIGH);
-        delay(interval);
-        digitalWrite(config.ledPin, LOW);
-        delay(interval);
-    }
-}
-
-void getMacAddress() {
-    esp_read_mac(macAddress, ESP_MAC_WIFI_STA);
-}
-
-mString generateHashFromMac() {
-    mString hashInput = "";
-    for (int i = 0; i < 6; i++) {
-        if (macAddress[i] < 0x10) hashInput += "0";
-        hashInput += String(macAddress[i], HEX);
-    }
-    uint32_t hash = 5381;
-    for (int i = 0; i < hashInput.length(); i++) {
-        hash = ((hash << 5) + hash) + hashInput.charAt(i);
-    }
-    mString result = String(hash, HEX);
-    while (result.length() < 16) result = "0" + result;
-    return result;
-}
-
-void loadConfigFromFile() {
-    if (!fd.begin()) {
-        Serial.println("FileData init failed");
-        return;
-    }
-    fd.get("ssid", config.ssid, sizeof(config.ssid));
-    fd.get("password", config.password, sizeof(config.password));
-    fd.get("serverUrl", config.serverUrl, sizeof(config.serverUrl));
-    fd.get("terminalHash", config.terminalHash, sizeof(config.terminalHash));
-    fd.get("queueLink", config.queueLink, sizeof(config.queueLink));
-    fd.get("webPassword", config.webPassword, sizeof(config.webPassword));
-    config.btnPin = fd.getInt("btnPin", DEFAULT_BTN_PIN);
-    config.ledPin = fd.getInt("ledPin", DEFAULT_LED_PIN);
-    config.oledSda = fd.getInt("oledSda", DEFAULT_OLED_SDA);
-    config.oledScl = fd.getInt("oledScl", DEFAULT_OLED_SCL);
-    config.oledEnabled = fd.getBool("oledEnabled", true);
-    Serial.println("Config loaded from FileData");
-}
-
-void saveConfigToFile() {
-    if (!fd.begin()) {
-        Serial.println("FileData init failed");
-        return;
-    }
-    fd.put("ssid", config.ssid);
-    fd.put("password", config.password);
-    fd.put("serverUrl", config.serverUrl);
-    fd.put("terminalHash", config.terminalHash);
-    fd.put("queueLink", config.queueLink);
-    fd.put("webPassword", config.webPassword);
-    fd.putInt("btnPin", config.btnPin);
-    fd.putInt("ledPin", config.ledPin);
-    fd.putInt("oledSda", config.oledSda);
-    fd.putInt("oledScl", config.oledScl);
-    fd.putBool("oledEnabled", config.oledEnabled);
-    Serial.println("Config saved to FileData");
-}
-
-void setupSettings() {
-    settings.setAuth(config.webPassword);
-    
-    settings.begin("WiFi Settings");
-    settings.text("ssid", "WiFi SSID", config.ssid, sizeof(config.ssid));
-    settings.text("password", "WiFi Password", config.password, sizeof(config.password), "", true);
-    settings.end();
-    
-    settings.begin("Server Settings");
-    settings.text("serverUrl", "Server URL", config.serverUrl, sizeof(config.serverUrl));
-    settings.text("queueLink", "Queue Link", config.queueLink, sizeof(config.queueLink));
-    settings.end();
-    
-    settings.begin("Hardware");
-    settings.number("btnPin", "Button Pin", config.btnPin, 0, 40);
-    settings.number("ledPin", "LED Pin", config.ledPin, 0, 40);
-    settings.number("oledSda", "OLED SDA", config.oledSda, 0, 40);
-    settings.number("oledScl", "OLED SCL", config.oledScl, 0, 40);
-    settings.checkbox("oledEnabled", "Enable OLED", config.oledEnabled);
-    settings.end();
-    
-    settings.onSave([]() {
-        saveConfigToFile();
-        delay(1000);
-        ESP.restart();
-    });
-}
-
-void connectToWifi();
-void startApMode();
-bool printerConnect();
-bool printerPrintTicket(int number, const char* type, const char* queueName, const char* hash);
-int getTicketFromServer();
-bool confirmPrintOnServer();
-void updateTime();
-
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n=== SmartQueue Terminal ===");
-    Serial.println("Version: " + String(VERSION));
-    
-    getMacAddress();
-    Serial.print("MAC: ");
-    for (int i = 0; i < 6; i++) {
-        if (macAddress[i] < 0x10) Serial.print("0");
-        Serial.print(macAddress[i], HEX);
-        if (i < 5) Serial.print(":");
-    }
-    Serial.println();
-    
-    // Load config from FileData
-    loadConfigFromFile();
-    
-    // Generate hash if empty
-    if (strlen(config.terminalHash) == 0) {
-        mString hash = generateHashFromMac();
-        strncpy(config.terminalHash, hash.c_str(), sizeof(config.terminalHash) - 1);
-        saveConfigToFile();
-    }
-    
-    pinMode(config.ledPin, OUTPUT);
-    pinMode(config.btnPin, INPUT_PULLUP);
-    btn.setType(TYPE_HIGH);
-    oledInit();
-    
-    // Setup Settings web interface
-    setupSettings();
-    
-    connectToWifi();
-    
-    // Start NTP sync if connected
-    if (WiFi.status() == WL_CONNECTED) {
-        ntp.begin();
-        updateTime();
-    }
-    
-    server.begin();
-    Serial.println("HTTP server started");
-    printerConnect();
-    ledBlink(3, 200);
-    oledShowStatus("Ready");
-}
-
-void loop() {
-    server.handleClient();
-    settings.tick();  // Handle Settings web interface
-    
-    // Sync NTP every hour
-    if (millis() - lastNtpSync > 3600000UL) {
-        if (ntp.tick()) {
-            updateTime();
-            lastNtpSync = millis();
+// =============================================================================
+//  ESC/POS через Bluetooth
+// =============================================================================
+static void btWrite(const uint8_t* d, size_t n) {
+#if BT_CLASSIC
+    if (SerialBT.connected()) SerialBT.write(d, n);
+#else
+    if (printerConnected && pBleRxChar) {
+        for (size_t off = 0; off < n; off += 20) {
+            size_t chunk = min((size_t)20, n - off);
+            pBleRxChar->writeValue(d + off, chunk, true);
+            delay(8);
         }
     }
-    
-    btn.tick();
-    if (btn.isClick()) {
-        if (ticketPending) {
-            oledShowStatus("Confirming...");
-            if (confirmPrintOnServer()) {
-                oledShowStatus("Confirmed!");
-                ledBlink(2, 100);
-                ticketPending = false;
-                pendingTicketNumber = 0;
-                pendingTicketId = 0;
-            } else {
-                oledShowStatus("Confirm failed");
-                ledBlink(3, 300);
-            }
-        } else {
-            oledShowStatus("Getting ticket...");
-            int result = getTicketFromServer();
-            if (result > 0) {
-                ticketPending = true;
-                oledShowTicket(pendingTicketNumber, "T");
-                ledBlink(5, 100);
-                if (printerPrintTicket(pendingTicketNumber, "T", config.queueLink, config.terminalHash))
-                    oledShowStatus("Printed - Press to confirm");
-            } else {
-                oledShowStatus("Get ticket failed");
-                ledBlink(2, 300);
-            }
-        }
-    }
-    static unsigned long lastTick = 0;
-    if (millis() - lastTick > 1000) {
-        lastTick = millis();
-        static int timeoutCounter = 0;
-        if (ticketPending) {
-            timeoutCounter++;
-            if (timeoutCounter > 60) {
-                ticketPending = false;
-                pendingTicketNumber = 0;
-                pendingTicketId = 0;
-                timeoutCounter = 0;
-                oledShowStatus("Timeout - Ready");
-            }
-        } else timeoutCounter = 0;
-    }
-    delay(10);
+#endif
+}
+static void btStr(const char* s)  { btWrite((const uint8_t*)s, strlen(s)); }
+static void btByte(uint8_t b)     { btWrite(&b, 1); }
+
+namespace ESC {
+    void init()               { uint8_t c[]={0x1B,0x40}; btWrite(c,2); delay(30); }
+    void feed(uint8_t n=3)    { uint8_t c[]={0x1B,0x64,n}; btWrite(c,3); }
+    void align(uint8_t a)     { uint8_t c[]={0x1B,0x61,a}; btWrite(c,3); }
+    void bold(bool on)        { uint8_t c[]={0x1B,0x45,(uint8_t)(on?1:0)}; btWrite(c,3); }
+    void dblSize(bool on)     { uint8_t c[]={0x1D,0x21,(uint8_t)(on?0x11:0x00)}; btWrite(c,3); }
+    void println(const char* s){ btStr(s); btByte(0x0A); }
+    void separator()          { println("------------------------"); }
 }
 
-// Implementations
-void connectToWifi() {
-    if (config.ssid.length() == 0) { startApMode(); return; }
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(config.ssid.c_str(), config.password.c_str());
-    oledShowStatus("Connecting WiFi...");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500); Serial.print("."); attempts++; ledBlink(1, 100);
+void printTicket(const String& num, const String& queue, const String& eta) {
+    if (!printerConnected) { Serial.println("[Printer] not connected"); return; }
+    ESC::init();
+    ESC::align(1); ESC::dblSize(true); ESC::bold(true);
+    ESC::println("SMART QUEUE");
+    ESC::dblSize(false); ESC::bold(false);
+    ESC::separator();
+    ESC::println(queue.c_str());
+    ESC::dblSize(true); ESC::bold(true);
+    ESC::println(num.c_str());
+    ESC::dblSize(false); ESC::bold(false);
+    if (eta.length()) { String s="Wait: "+eta; ESC::align(0); ESC::println(s.c_str()); }
+    ESC::separator();
+    ESC::feed(4);
+    Serial.printf("[Printer] Ticket %s printed\n", num.c_str());
+}
+
+// =============================================================================
+//  Bluetooth-подключение
+// =============================================================================
+#if BT_CLASSIC
+bool connectBT() {
+    String mac = db[K_BT_MAC].toString();
+    if (mac.length() < 17) mac = DEFAULT_PRINTER_MAC;
+    uint8_t addr[6];
+    if (sscanf(mac.c_str(),"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &addr[0],&addr[1],&addr[2],&addr[3],&addr[4],&addr[5]) != 6) {
+        Serial.println("[BT] Bad MAC");
+        return false;
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        oledShowStatus("WiFi Connected");
-        Serial.println("\nWiFi connected");
-        Serial.print("IP: "); Serial.println(WiFi.localIP());
-        digitalWrite(config.ledPin, HIGH);
-    } else { oledShowStatus("WiFi Failed - AP Mode"); startApMode(); }
+    SerialBT.end();
+    delay(200);
+    if (!SerialBT.begin("SmartQueue", true)) return false;
+    bool ok = SerialBT.connect(addr);
+    printerConnected = ok;
+    if (ok) { delay(200); ESC::init(); Serial.println("[BT] Connected"); }
+    else      Serial.println("[BT] Failed");
+    return ok;
 }
-
-void startApMode() {
-    isApMode = true;
-    mString apName = "SmartQueue-";
-    apName += String(macAddress[4], HEX); apName += String(macAddress[5], HEX);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(apName.c_str(), "smartqueue");
-    Serial.println("AP Mode started");
-    Serial.print("AP Name: "); Serial.println(apName);
-    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
-    oledShowStatus("AP Mode Active");
-}
-
-bool printerConnect() {
-    // For ESP32-WROOM-32, using HardwareSerial for thermal printer via UART
-    Serial2.begin(9600, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
-    Serial.println("UART Printer initialized on Serial2");
+#else
+class BleCallbacks : public NimBLEClientCallbacks {
+    void onDisconnect(NimBLEClient*) override {
+        printerConnected = false;
+        Serial.println("[BLE] Disconnected");
+    }
+};
+bool connectBT() {
+    String mac = db[K_BT_MAC].toString();
+    if (mac.length() < 17) mac = DEFAULT_PRINTER_MAC;
+    NimBLEDevice::init("SmartQueue-C3");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    pBleClient = NimBLEDevice::createClient();
+    pBleClient->setClientCallbacks(new BleCallbacks, false);
+    if (!pBleClient->connect(NimBLEAddress(mac.c_str(), BLE_ADDR_PUBLIC))) {
+        Serial.println("[BLE] Connect failed"); return false;
+    }
+    auto* svc = pBleClient->getService(NUS_SVC);
+    if (!svc) { pBleClient->disconnect(); Serial.println("[BLE] No NUS svc"); return false; }
+    pBleRxChar = svc->getCharacteristic(NUS_RX);
+    if (!pBleRxChar) { pBleClient->disconnect(); Serial.println("[BLE] No RX char"); return false; }
+    printerConnected = true;
+    delay(200); ESC::init();
+    Serial.println("[BLE] Connected");
     return true;
 }
+#endif
 
-bool printerPrintTicket(int number, const char* type, const char* queueName, const char* hash) {
-    mString receipt = "";
-    receipt += "\x1B\x40"; receipt += "\x1B\x61\x01";
-    receipt += "SMARTQUEUE\n----------------\nQueue: "; receipt += queueName; receipt += "\n";
-    receipt += "\x1B\x21\x30"; receipt += "TALON: "; receipt += type; receipt += String(number); receipt += "\n";
-    receipt += "\x1B\x21\x00"; receipt += "Date: "; receipt += __DATE__; receipt += " "; receipt += __TIME__; receipt += "\n";
-    receipt += "Hash: "; receipt += hash; receipt += "\n----------------\n\x1B\x64\x03";
-    Serial2.print(receipt.c_str()); delay(1000); return true;
-}
-
-int getTicketFromServer() {
-    if (config.serverUrl.length() == 0 || config.queueLink.length() == 0) return -1;
-    HTTPClient http;
-    mString url = config.serverUrl + "/queues/api/terminal/ticket/";
-    http.begin(url.c_str()); http.addHeader("Content-Type", "application/json");
-    mString jsonBody = "{\"link\":\""; jsonBody += config.queueLink; jsonBody += "\",\"terminal_hash\":\""; jsonBody += config.terminalHash; jsonBody += "\"}";
-    int httpCode = http.POST(jsonBody.c_str());
-    if (httpCode > 0) {
-        mString response = http.getString(); Serial.println("Response: " + response);
-        int ticketNumPos = response.indexOf("\"ticket_number\":");
-        if (ticketNumPos > 0) { int start = ticketNumPos + 16; int end = response.indexOf(',', start); if (end == -1) end = response.indexOf('}', start); mString numStr = response.substring(start, end); pendingTicketNumber = numStr.toInt(); }
-        int ticketIdPos = response.indexOf("\"ticket_id\":");
-        if (ticketIdPos > 0) { int start = ticketIdPos + 12; int end = response.indexOf(',', start); if (end == -1) end = response.indexOf('}', start); mString idStr = response.substring(start, end); pendingTicketId = idStr.toInt(); }
-        http.end(); if (pendingTicketNumber > 0) return 1;
+// =============================================================================
+//  WiFi — Personal (PSK)
+// =============================================================================
+bool connectWifiPSK(const String& ssid, const String& psk) {
+    Serial.printf("[WiFi] PSK → %s\n", ssid.c_str());
+    WiFi.disconnect(true); WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), psk.c_str());
+    for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500); Serial.print('.');
     }
-    http.end(); return -1;
+    Serial.println();
+    return WiFi.status() == WL_CONNECTED;
 }
 
-bool confirmPrintOnServer() {
-    if (pendingTicketId <= 0) return false;
-    HTTPClient http;
-    mString url = config.serverUrl + "/queues/api/terminal/confirm/";
-    http.begin(url.c_str()); http.addHeader("Content-Type", "application/json");
-    mString jsonBody = "{\"ticket_id\":"; jsonBody += String(pendingTicketId); jsonBody += ",\"terminal_hash\":\""; jsonBody += config.terminalHash; jsonBody += "\"}";
-    int httpCode = http.POST(jsonBody.c_str());
-    if (httpCode > 0) { mString response = http.getString(); Serial.println("Confirm response: " + response); http.end(); return response.indexOf("\"success\":true") > 0; }
-    http.end(); return false;
-}
+// =============================================================================
+//  WiFi — Enterprise (802.1X / EAP)
+//
+//  Метод:  0 = PEAP-MSCHAPv2   (самый распространённый, Eduroam)
+//          1 = EAP-TTLS-PAP
+//          2 = EAP-TLS          (только сертификаты, без пароля)
+//
+//  Identity  = анонимная (outer) идентификация, напр. "anonymous@domain"
+//  Username  = настоящее имя пользователя (inner/MSCHAPV2)
+//  Password  = пароль пользователя
+//  CA cert   = PEM-строка корневого сертификата RADIUS (опционально,
+//              но рекомендуется для предотвращения MITM)
+// =============================================================================
+bool connectWifiEnterprise(const String& ssid,
+                           int           method,
+                           const String& identity,
+                           const String& username,
+                           const String& password,
+                           const String& caCert) {
+    Serial.printf("[WiFi] Enterprise → %s (method=%d)\n", ssid.c_str(), method);
 
-void updateTime() {
-    if (ntp.valid()) {
-        snprintf(currentTime, sizeof(currentTime), "%02d:%02d:%02d %02d.%02d.%04d",
-            ntp.hour(), ntp.minute(), ntp.second(),
-            ntp.day(), ntp.month(), ntp.year());
-        Serial.printf("NTP Time: %s\n", currentTime);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    // Чистим предыдущие EAP-настройки
+    esp_wifi_sta_wpa2_ent_disable();
+
+    // Внешняя идентификация (anonymous outer identity)
+    if (identity.length()) {
+        esp_wifi_sta_wpa2_ent_set_identity(
+            (uint8_t*)identity.c_str(), identity.length());
+    }
+
+    if (method == 2) {
+        // EAP-TLS: сертификаты, пароль не используется
+        // CA cert
+        if (caCert.length()) {
+            esp_wifi_sta_wpa2_ent_set_ca_cert(
+                (uint8_t*)caCert.c_str(), caCert.length() + 1);
+        }
+        // Клиентский сертификат и ключ здесь не реализованы —
+        // их нужно прошивать отдельно через спец. раздел NVS.
+        Serial.println("[WiFi] EAP-TLS: client cert/key must be set via NVS");
     } else {
-        strcpy(currentTime, "No NTP sync");
+        // PEAP или TTLS — нужны имя пользователя + пароль
+        if (username.length()) {
+            esp_wifi_sta_wpa2_ent_set_username(
+                (uint8_t*)username.c_str(), username.length());
+        }
+        if (password.length()) {
+            esp_wifi_sta_wpa2_ent_set_password(
+                (uint8_t*)password.c_str(), password.length());
+        }
+        if (caCert.length()) {
+            esp_wifi_sta_wpa2_ent_set_ca_cert(
+                (uint8_t*)caCert.c_str(), caCert.length() + 1);
+        }
+        if (method == 1) {
+            // TTLS: переключаем phase2 на PAP
+            esp_wifi_sta_wpa2_ent_set_ttls_phase2_method(
+                ESP_EAP_TTLS_PHASE2_PAP);
+        }
+        // method == 0 → PEAP-MSCHAPv2 (дефолт, ничего дополнительно)
     }
+
+    // arduino-esp32 v2.0+: esp_wifi_sta_wpa2_ent_enable() без аргументов
+    // (esp_wpa2_config_t и WPA2_CONFIG_INIT_DEFAULT удалены из нового SDK)
+    esp_wifi_sta_wpa2_ent_enable();
+
+    WiFi.begin(ssid.c_str());
+
+    for (int i = 0; i < 60 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500); Serial.print('.');
+    }
+    Serial.println();
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// =============================================================================
+//  Единая точка подключения к WiFi
+// =============================================================================
+void doConnect() {
+    int   mode     = (int)db[K_WIFI_MODE].toInt();
+    String ssid    = db[K_SSID].toString();
+    bool ok = false;
+
+    if (ssid.isEmpty()) {
+        Serial.println("[WiFi] SSID not set, starting AP");
+        return;
+    }
+
+    if (mode == 0) {
+        ok = connectWifiPSK(ssid, db[K_PSK].toString());
+    } else {
+        ok = connectWifiEnterprise(
+            ssid,
+            (int)db[K_EAP_METHOD].toInt(),
+            db[K_EAP_IDENTITY].toString(),
+            db[K_EAP_USER].toString(),
+            db[K_EAP_PASS].toString(),
+            db[K_EAP_CA_CERT].toString()
+        );
+    }
+
+    if (ok) {
+        wifiConnected = true;
+        Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        wifiConnected = false;
+        Serial.println("[WiFi] Failed");
+    }
+}
+
+void startAP() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("SmartQueue-Setup", "12345678");
+    Serial.printf("[WiFi] AP: SmartQueue-Setup  IP: %s\n",
+                  WiFi.softAPIP().toString().c_str());
+}
+
+// =============================================================================
+//  Простой HMAC-SHA256 через mbedTLS для подписи API-запросов
+//  Подпись передаётся в заголовке X-Signature: HMAC-SHA256 <hex>
+// =============================================================================
+#include <mbedtls/md.h>
+
+String hmacSha256(const String& key, const String& data) {
+    uint8_t out[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    mbedtls_md_hmac_starts(&ctx,
+        (const uint8_t*)key.c_str(), key.length());
+    mbedtls_md_hmac_update(&ctx,
+        (const uint8_t*)data.c_str(), data.length());
+    mbedtls_md_hmac_finish(&ctx, out);
+    mbedtls_md_free(&ctx);
+
+    String hex; hex.reserve(64);
+    for (int i = 0; i < 32; i++) {
+        char buf[3];
+        snprintf(buf, 3, "%02x", out[i]);
+        hex += buf;
+    }
+    return hex;
+}
+
+// =============================================================================
+//  Опрос API-сервера
+// =============================================================================
+#include <WiFiClient.h>
+#include <HTTPClient.h>
+
+void pollServer() {
+    String apiUrl    = db[K_API_URL].toString();
+    String queueId   = db[K_API_QUEUE].toString();
+    String apiToken  = db[K_API_TOKEN].toString();
+    String apiSecret = db[K_API_SECRET].toString();
+
+    if (!wifiConnected || apiUrl.isEmpty() || queueId.isEmpty()) return;
+
+    String url = apiUrl + "/api/queues/" + queueId + "/next_ticket/";
+    Serial.printf("[API] GET %s\n", url.c_str());
+
+    WiFiClient   wc;
+    HTTPClient   http;
+    http.begin(wc, url);
+
+    // Bearer-токен
+    if (apiToken.length()) {
+        http.addHeader("Authorization", "Token " + apiToken);
+    }
+
+    // HMAC-подпись: подписываем метод + URL
+    if (apiSecret.length()) {
+        String msg = "GET:" + url;
+        String sig = hmacSha256(apiSecret, msg);
+        http.addHeader("X-Signature", "HMAC-SHA256 " + sig);
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    int code = http.GET();
+    Serial.printf("[API] %d\n", code);
+
+    if (code == 200) {
+        String body = http.getString();
+        Serial.printf("[API] %s\n", body.c_str());
+
+        // Примитивный JSON-парсинг без зависимости ArduinoJson
+        auto jField = [](const String& j, const String& k) -> String {
+            String sk = "\"" + k + "\":\"";
+            int s = j.indexOf(sk);
+            if (s < 0) return "";
+            s += sk.length();
+            int e = j.indexOf('"', s);
+            return (e < 0) ? "" : j.substring(s, e);
+        };
+
+        String num   = jField(body, "number");
+        String queue = jField(body, "queue");
+        String eta   = jField(body, "eta");
+        if (num.isEmpty()) num = body;
+        if (queue.isEmpty()) queue = "Queue";
+        printTicket(num, queue, eta);
+    }
+    // 204/404 → нет талонов, игнорируем
+    http.end();
+}
+
+// =============================================================================
+//  Построитель веб-интерфейса Settings
+// =============================================================================
+void buildUI(sets::Builder& b) {
+
+    // ── Статус (только чтение, виден гостям) ─────────────────────────────
+    {
+        sets::GuestAccess ga(b);           // виден без пароля
+        sets::Group g(b, "Статус");
+
+        b.Label("lbl_ip"_h,   "IP-адрес",
+            wifiConnected ? WiFi.localIP().toString().c_str() : "Нет подключения");
+        b.Label("lbl_bt"_h,   "Принтер",
+            printerConnected ? "Подключён" : "Отключён");
+        b.Label("lbl_fw"_h,   "Прошивка", FW_VERSION);
+        b.Label("lbl_up"_h,   "Uptime (с)",
+            String(millis() / 1000).c_str());
+    }
+
+    // ── WiFi ─────────────────────────────────────────────────────────────
+    {
+        sets::Menu m(b, "WiFi");
+
+        b.Select(K_WIFI_MODE, "Режим", "Personal (PSK);Enterprise (EAP)");
+
+        b.Input(K_SSID, "SSID");
+
+        // Personal
+        {
+            sets::Group g(b, "Personal (WPA/WPA2-PSK)");
+            b.Pass(K_PSK, "Пароль сети", "••••••••");
+        }
+
+        // Enterprise
+        {
+            sets::Group g(b, "Enterprise (802.1X)");
+            b.Select(K_EAP_METHOD, "EAP-метод",
+                     "PEAP-MSCHAPv2 (Eduroam);EAP-TTLS-PAP;EAP-TLS (сертификат)");
+            b.Input(K_EAP_IDENTITY, "Outer identity (напр. anonymous@domain)");
+            b.Input(K_EAP_USER,     "Username (inner)");
+            b.Pass (K_EAP_PASS,     "Password", "••••••••");
+            b.Input(K_EAP_CA_CERT,  "CA-сертификат (PEM, опционально)");
+        }
+
+        {
+            sets::Buttons btns(b);
+            if (b.Button("btn_wifi_save"_h, "Сохранить и переподключить",
+                         sets::Colors::Mint)) {
+                Serial.println("[WiFi] Reconnect requested");
+                WiFi.disconnect(true);
+                wifiConnected = false;
+                delay(300);
+                doConnect();
+                b.reload();
+            }
+        }
+    }
+
+    // ── API-сервер ────────────────────────────────────────────────────────
+    {
+        sets::Menu m(b, "API-сервер");
+
+        b.Input(K_API_URL,   "URL сервера (http://host:port)");
+        b.Input(K_API_QUEUE, "UUID очереди");
+
+        {
+            sets::Group g(b, "Аутентификация");
+            b.Pass(K_API_TOKEN,  "Bearer-токен",  "••••••••");
+            b.Pass(K_API_SECRET, "HMAC-секрет (X-Signature)", "••••••••");
+        }
+
+        {
+            sets::Buttons btns(b);
+            if (b.Button("btn_api_test"_h, "Тест соединения")) {
+                Serial.println("[API] Manual poll requested");
+                pollServer();
+            }
+        }
+    }
+
+    // ── Принтер ──────────────────────────────────────────────────────────
+    {
+        sets::Menu m(b, "Принтер Bluetooth");
+
+        b.Input(K_BT_MAC, "MAC-адрес (XX:XX:XX:XX:XX:XX)");
+
+#if BT_CLASSIC
+        b.Label("lbl_btm"_h, "Интерфейс", "Classic SPP (WROOM)");
+#else
+        b.Label("lbl_btm"_h, "Интерфейс", "BLE NUS (C3)");
+#endif
+
+        {
+            sets::Buttons btns(b);
+            if (b.Button("btn_bt_connect"_h, "Переподключить принтер",
+                         sets::Colors::Blue)) {
+                printerConnected = false;
+#if BT_CLASSIC
+                SerialBT.disconnect(); delay(300);
+#else
+                if (pBleClient && pBleClient->isConnected()) {
+                    pBleClient->disconnect(); delay(300);
+                }
+#endif
+                connectBT();
+                b.reload();
+            }
+            if (b.Button("btn_bt_test"_h, "Тест печати")) {
+                printTicket("A001", "TEST QUEUE", "~0 min");
+            }
+        }
+    }
+
+    // ── Безопасность ─────────────────────────────────────────────────────
+    {
+        sets::Menu m(b, "Безопасность");
+        b.Pass(K_WEB_PASS, "Пароль веб-интерфейса", "••••••••");
+
+        if (b.Input(K_WEB_PASS, "Новый пароль")) {
+            String np = db[K_WEB_PASS].toString();
+            sett.setPass(np.c_str());
+            Serial.println("[Auth] Password updated");
+        }
+    }
+
+    // ── OTA + файловый менеджер ───────────────────────────────────────────
+    // Settings встраивает OTA автоматически — кнопка появляется в правом
+    // верхнем меню веб-интерфейса.  Дополнительных строк не требуется.
+
+    // ── Перезагрузка ─────────────────────────────────────────────────────
+    {
+        sets::Group g(b, "Система");
+        {
+            sets::Buttons btns(b);
+            if (b.Button("btn_reboot"_h, "Перезагрузить", sets::Colors::Red)) {
+                Serial.println("[SYS] Reboot requested");
+                delay(500);
+                ESP.restart();
+            }
+        }
+    }
+}
+
+// =============================================================================
+//  Обновление динамических меток (вызывается периодически из onUpdate)
+// =============================================================================
+void updateUI(sets::Updater& upd) {
+    upd.update("lbl_ip"_h,
+        wifiConnected ? WiFi.localIP().toString().c_str() : "Нет подключения");
+    upd.update("lbl_bt"_h,
+        printerConnected ? "Подключён" : "Отключён");
+    upd.update("lbl_up"_h,
+        String(millis() / 1000).c_str());
+}
+
+// =============================================================================
+//  SETUP
+// =============================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(400);
+    Serial.println("\n=== SmartQueue Terminal v2 ===");
+#if BT_CLASSIC
+    Serial.println("Board: WROOM-32  BT: Classic SPP");
+#else
+    Serial.println("Board: C3 SuperMini  BT: BLE NUS");
+#endif
+
+    // 1. Файловая система
+    if (!LittleFS.begin(true)) {
+        Serial.println("[FS] LittleFS FAIL — formatting...");
+    } else {
+        Serial.println("[FS] OK");
+    }
+
+    // 2. База данных
+    db.begin();
+
+    // 3. Инициализация значений по умолчанию
+    //    db.init() записывает только если ключа ещё нет
+    db.init(K_WIFI_MODE,    (uint8_t)0);
+    db.init(K_SSID,         "");
+    db.init(K_PSK,          "");
+    db.init(K_EAP_METHOD,   (uint8_t)0);
+    db.init(K_EAP_IDENTITY, "anonymous");
+    db.init(K_EAP_USER,     "");
+    db.init(K_EAP_PASS,     "");
+    db.init(K_EAP_CA_CERT,  "");
+    db.init(K_API_URL,      "http://192.168.1.100:8000");
+    db.init(K_API_QUEUE,    "");
+    db.init(K_API_TOKEN,    "");
+    db.init(K_API_SECRET,   "");
+    db.init(K_BT_MAC,       DEFAULT_PRINTER_MAC);
+    db.init(K_WEB_PASS,     "");
+    db.init(K_CONFIGURED,   (uint8_t)0);
+
+    // 4. Веб-интерфейс
+    sett.onBuild(buildUI);
+    sett.onUpdate(updateUI);
+
+    // Восстанавливаем пароль веб-интерфейса из БД
+    String savedPass = db[K_WEB_PASS].toString();
+    if (savedPass.length()) sett.setPass(savedPass.c_str());
+
+    // 5. WiFi
+    bool configured = (bool)db[K_CONFIGURED].toInt();
+    String ssid     = db[K_SSID].toString();
+
+    if (!configured || ssid.isEmpty()) {
+        Serial.println("[Setup] First run → AP mode");
+        startAP();
+    } else {
+        doConnect();
+        if (!wifiConnected) {
+            Serial.println("[Setup] WiFi failed → fallback AP");
+            startAP();
+        }
+    }
+
+    // 6. Settings (регистрирует маршруты + вызывает server.begin())
+    sett.begin();
+    Serial.printf("[HTTP] Web UI → http://%s\n",
+        wifiConnected ? WiFi.localIP().toString().c_str()
+                      : WiFi.softAPIP().toString().c_str());
+
+    // 7. Принтер
+    if (configured) {
+        connectBT();
+        if (printerConnected) {
+            ESC::align(1); ESC::bold(true); ESC::println("SmartQueue v2");
+            ESC::bold(false); ESC::println("Ready"); ESC::feed(2);
+        }
+    }
+
+    // 8. Отмечаем что настройки применены (при первом сохранении данных
+    //    пользователь должен нажать "Сохранить", после чего делается
+    //    перезагрузка — и configured становится 1)
+    if (!configured && !ssid.isEmpty()) {
+        db[K_CONFIGURED] = (uint8_t)1;
+    }
+
+    Serial.println("[Setup] Done.");
+}
+
+// =============================================================================
+//  LOOP
+// =============================================================================
+void loop() {
+    sett.server.handleClient(); // HTTP-обработчик (WebServer встроен в SettingsESP)
+    sett.tick();              // Settings: WebSocket, OTA, обновление виджетов
+
+    // Опрос API
+    if (wifiConnected && millis() - lastPoll >= POLL_INTERVAL_MS) {
+        lastPoll = millis();
+        pollServer();
+    }
+
+    yield();
 }

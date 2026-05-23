@@ -1,9 +1,13 @@
-GyverLibs/GyverHub@^1.0.0
+GyverLibs/FileData@^1.0.0
+GyverLibs/GyverNTP@^1.0.0
+bblanchon/ArduinoJson@^7.0.0
+knolleary/PubSubClient@^2.8.0
+GyverLibs/Settings@^1.0.0
 GyverLibs/GyverUART@^1.0.0
 GyverLibs/GSON@^1.0.0
-knolleary/PubSubClient@^2.8.0
-GyverLibs/mString@^1.0.0
-bblanchon/ArduinoJson@^7.0.0
 GyverLibs/GyverButton@^7.0.0
-lorol/LittleFS_esp32@^1.0.6
+AlexGyver/GyverPortal@^1.0.0
 GyverLibs/GyverOLED@^2.0.0
+GyverLibs/mString@^1.0.0
+adafruit/Adafruit Thermal Printer@^1.2.0
+lorol/LittleFS_esp32@^1.0.6
