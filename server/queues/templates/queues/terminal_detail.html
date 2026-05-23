@@ -1,0 +1,58 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ terminal.name }} - Терминал{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h4>{{ terminal.name }}</h4>
+            <div>
+                <a href="{% url 'queues:edit_terminal' pk=terminal.pk %}" class="btn btn-sm btn-warning">Редактировать</a>
+                <a href="{% url 'queues:delete_terminal' pk=terminal.pk %}" class="btn btn-sm btn-danger">Удалить</a>
+            </div>
+        </div>
+        <div class="card-body">
+            <table class="table">
+                <tbody>
+                    <tr>
+                        <th>ID</th>
+                        <td>{{ terminal.pk }}</td>
+                    </tr>
+                    <tr>
+                        <th>Hash секрет</th>
+                        <td><code>{{ terminal.hash_secret }}</code></td>
+                    </tr>
+                    <tr>
+                        <th>Статус</th>
+                        <td>
+                            {% if terminal.is_active %}
+                                <span class="badge bg-success">Активен</span>
+                            {% else %}
+                                <span class="badge bg-danger">Не активен</span>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    <tr>
+                        <th>MAC адрес</th>
+                        <td>{{ terminal.mac_address|default:"Не указан" }}</td>
+                    </tr>
+                    <tr>
+                        <th>Версия прошивки</th>
+                        <td>{{ terminal.firmware_version }}</td>
+                    </tr>
+                    <tr>
+                        <th>Дата создания</th>
+                        <td>{{ terminal.created_at }}</td>
+                    </tr>
+                    <tr>
+                        <th>Последнее подключение</th>
+                        <td>{{ terminal.last_seen|default:"Никогда" }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <a href="{% url 'queues:terminal_list' %}" class="btn btn-secondary mt-3">Назад к списку</a>
+</div>
+{% endblock %}

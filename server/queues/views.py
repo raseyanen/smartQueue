@@ -521,6 +521,53 @@ def terminal_register(request):
 
 
 @login_required
+def create_terminal(request):
+    """Создание нового терминала (альтернативное имя для terminal_register)"""
+    return terminal_register(request)
+
+
+@login_required
+def terminal_detail(request, pk):
+    """Детали терминала"""
+    terminal = get_object_or_404(Terminal, pk=pk, owner=request.user)
+    return render(request, 'queues/terminal_detail.html', {'terminal': terminal})
+
+
+@login_required
+def edit_terminal(request, pk):
+    """Редактирование терминала"""
+    terminal = get_object_or_404(Terminal, pk=pk, owner=request.user)
+    
+    if request.method == 'POST':
+        name = request.POST.get('name')
+        is_active = request.POST.get('is_active') == 'on'
+        
+        if not name:
+            messages.error(request, 'Название терминала обязательно')
+        else:
+            terminal.name = name
+            terminal.is_active = is_active
+            terminal.save()
+            messages.success(request, 'Терминал обновлен')
+            return redirect('queues:terminal_detail', pk=terminal.pk)
+    
+    return render(request, 'queues/terminal_form.html', {'terminal': terminal})
+
+
+@login_required
+def delete_terminal(request, pk):
+    """Удаление терминала"""
+    terminal = get_object_or_404(Terminal, pk=pk, owner=request.user)
+    
+    if request.method == 'POST':
+        terminal.delete()
+        messages.success(request, 'Терминал удален')
+        return redirect('queues:terminal_list')
+    
+    return render(request, 'queues/terminal_confirm_delete.html', {'terminal': terminal})
+
+
+@login_required
 def terminal_list(request):
     """Список терминалов пользователя"""
     terminals = Terminal.objects.filter(owner=request.user)
