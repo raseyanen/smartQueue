@@ -1,104 +1,64 @@
 #include "bt_printer.h"
 #include "raster_font.h"
 #include "logger.h"
+#include <NimBLEDevice.h>
 #include <stdlib.h>
 
 #define TAG "BT"
 
-#if BT_CLASSIC
-    #include <BluetoothSerial.h>
-    extern BluetoothSerial SerialBT;
-    static bool sppStarted = false;   // SerialBT.begin() вызван?
-#else
-    #include <NimBLEDevice.h>
-    extern NimBLEClient*                pBleClient;
-    extern NimBLERemoteCharacteristic*  pBleRxChar;
-    static bool bleStarted = false;
-#endif
+static NimBLEClient*                pClient    = nullptr;
+static NimBLERemoteCharacteristic*  pWriteChar = nullptr;
+static bool bleStarted = false;
 
 // =============================================================================
-//  Проверка живости — БЕЗОПАСНАЯ (не крашит если стек не запущен)
+//  BLE Callbacks — сигнатура зависит от версии NimBLE
+// =============================================================================
+class PrinterCallbacks : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* cli) {
+        LOGI(TAG, "BLE onConnect");
+    }
+    void onDisconnect(NimBLEClient* cli, int reason) {
+        g_printerConnected = false;
+        LOGW(TAG, "BLE onDisconnect (reason=%d)", reason);
+    }
+};
+
+static PrinterCallbacks bleCallbacks;
+
 // =============================================================================
 bool bt_is_alive() {
-#if BT_CLASSIC
-    // НЕЛЬЗЯ вызывать SerialBT.connected() до SerialBT.begin()!
-    if (!sppStarted) return false;
-    return SerialBT.connected();
-#else
     if (!bleStarted) return false;
-    return (pBleClient != nullptr &&
-            pBleClient->isConnected() &&
-            pBleRxChar != nullptr);
-#endif
+    return (pClient != nullptr &&
+            pClient->isConnected() &&
+            pWriteChar != nullptr);
 }
 
-// =============================================================================
-//  Отправка данных
 // =============================================================================
 bool bt_write(const uint8_t* d, size_t n) {
     if (!d || n == 0) return false;
     if (!g_printerConnected || !bt_is_alive()) {
-        LOGW(TAG, "write: no connection");
         g_printerConnected = false;
         return false;
     }
 
-#if BT_CLASSIC
-    for (size_t off = 0; off < n; off += SPP_CHUNK_SIZE) {
-        size_t chunk = min((size_t)SPP_CHUNK_SIZE, n - off);
-        size_t written = SerialBT.write(d + off, chunk);
-        if (written != chunk) {
-            LOGE(TAG, "SPP write: %u/%u at %u", written, chunk, off);
-            return false;
-        }
-        if (n > SPP_CHUNK_SIZE) delay(SPP_CHUNK_DELAY_MS);
-    }
-    return true;
-#else
     for (size_t off = 0; off < n; off += BLE_CHUNK_SIZE) {
         size_t chunk = min((size_t)BLE_CHUNK_SIZE, n - off);
-        if (!pBleRxChar->writeValue(d + off, chunk, true)) {
+        if (!pWriteChar->writeValue(d + off, chunk, false)) {
             LOGE(TAG, "BLE write err at %u", off);
             return false;
         }
         delay(BLE_CHUNK_DELAY_MS);
     }
     return true;
-#endif
 }
 
-// =============================================================================
-//  Отправка растрового блока
-// =============================================================================
-static bool sendRasterBlock(const uint8_t* data, int widthBytes, int height) {
-    for (int y = 0; y < height; y += RASTER_BLOCK_HEIGHT) {
-        int blockH = min(RASTER_BLOCK_HEIGHT, height - y);
-
-        uint8_t hdr[] = {
-            0x1D, 0x76, 0x30, 0x00,
-            (uint8_t)(widthBytes & 0xFF),
-            (uint8_t)((widthBytes >> 8) & 0xFF),
-            (uint8_t)(blockH & 0xFF),
-            (uint8_t)((blockH >> 8) & 0xFF)
-        };
-
-        if (!bt_write(hdr, sizeof(hdr))) return false;
-        if (!bt_write(data + y * widthBytes, blockH * widthBytes)) return false;
-
-        delay(blockH * 2 + 30);
-    }
-    return true;
-}
-
-// =============================================================================
-//  MAC из БД
 // =============================================================================
 static void readMac(char* buf, size_t sz) {
     auto v = g_db[K_BT_MAC];
     const char* s = v.toString().c_str();
     if (strlen(s) < 17) {
         strncpy(buf, DEFAULT_PRINTER_MAC, sz - 1);
-        LOGW(TAG, "Using default MAC: %s", DEFAULT_PRINTER_MAC);
+        LOGW(TAG, "MAC default: %s", DEFAULT_PRINTER_MAC);
     } else {
         strncpy(buf, s, sz - 1);
     }
@@ -106,248 +66,217 @@ static void readMac(char* buf, size_t sz) {
 }
 
 // =============================================================================
-//  Classic SPP
+//  Подключение к FunnyPrint (BLE)
+//
+//  Ищем характеристику AE01 во всех сервисах.
+//  Если не найдена — пробуем NUS (6E400002) как fallback.
 // =============================================================================
-#if BT_CLASSIC
-
 bool bt_connect() {
     char macBuf[20];
     readMac(macBuf, sizeof(macBuf));
 
-    uint8_t addr[6];
-    if (sscanf(macBuf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-               &addr[0], &addr[1], &addr[2], &addr[3],
-               &addr[4], &addr[5]) != 6) {
-        LOGE(TAG, "Bad MAC: '%s'", macBuf);
+    if (strcmp(macBuf, DEFAULT_PRINTER_MAC) == 0) {
+        LOGW(TAG, "MAC is default, skip");
         return false;
     }
 
-    LOGI(TAG, "Target: %02X:%02X:%02X:%02X:%02X:%02X",
-         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    LOGI(TAG, "Connecting to %s ...", macBuf);
+    LOGI(TAG, "Heap: %u", ESP.getFreeHeap());
 
-    // --- Инициализация стека (один раз) ---
-    if (!sppStarted) {
-        LOGI(TAG, "Starting BT Classic stack...");
-        if (!SerialBT.begin(BT_NAME_CLASSIC, true)) {
-            LOGE(TAG, "SerialBT.begin() FAILED");
-            return false;
-        }
-        sppStarted = true;
-        LOGI(TAG, "BT stack started OK");
-        delay(1000);  // стек стабилизируется
-    }
-
-    // --- Если уже подключены — отключаемся ---
-    if (SerialBT.connected()) {
-        LOGI(TAG, "Already connected, disconnect first");
-        SerialBT.disconnect();
-        delay(1500);
-    }
-
-    // --- Попытки подключения ---
-    for (int attempt = 1; attempt <= BT_CONNECT_RETRIES; attempt++) {
-        LOGI(TAG, "SPP attempt %d/%d ...", attempt, BT_CONNECT_RETRIES);
-
-        bool ok = SerialBT.connect(addr);
-        delay(1000);  // ждём установки
-
-        if (ok && SerialBT.connected()) {
-            g_printerConnected = true;
-            LOGI(TAG, "SPP connected (attempt %d)!", attempt);
-
-            delay(1500);  // принтер инициализируется
-
-            raster_init();
-            delay(500);
-
-            if (SerialBT.connected()) {
-                LOGI(TAG, "Printer ready");
-                return true;
-            }
-
-            LOGW(TAG, "Dropped after init");
-            g_printerConnected = false;
-        } else {
-            LOGW(TAG, "Attempt %d failed", attempt);
-            if (attempt == 1) {
-                LOGW(TAG, "Check: is printer ON? Correct MAC?");
-                LOGW(TAG, "Check: is printer BLE-only?");
-            }
-        }
-
-        if (attempt < BT_CONNECT_RETRIES) {
-            LOGI(TAG, "Wait %d ms ...", BT_RETRY_DELAY_MS);
-            delay(BT_RETRY_DELAY_MS);
-        }
-    }
-
-    LOGE(TAG, "All attempts failed");
-    g_printerConnected = false;
-    return false;
-}
-
-void bt_disconnect() {
-    LOGI(TAG, "Disconnect requested");
-    // Проверяем что стек запущен перед любым обращением к SerialBT
-    if (sppStarted && SerialBT.connected()) {
-        SerialBT.disconnect();
-        delay(500);
-    }
-    g_printerConnected = false;
-    LOGI(TAG, "Disconnected");
-}
-
-#else
-// =============================================================================
-//  BLE NUS
-// =============================================================================
-
-class BtPrinterCallbacks : public NimBLEClientCallbacks {
-    void onConnect(NimBLEClient*) override {
-        LOGI("BLE", "onConnect");
-    }
-    void onDisconnect(NimBLEClient*) override {
-        g_printerConnected = false;
-        LOGW("BLE", "onDisconnect");
-    }
-};
-
-static BtPrinterCallbacks bleCallbacks;
-
-bool bt_connect() {
-    char macBuf[20];
-    readMac(macBuf, sizeof(macBuf));
-
-    LOGI(TAG, "BLE target: %s", macBuf);
-
-    // Инициализация один раз
+    // Init NimBLE один раз
     if (!bleStarted) {
-        NimBLEDevice::init(BT_NAME_BLE);
+        LOGI(TAG, "Starting NimBLE...");
+        NimBLEDevice::init(BT_NAME);
         NimBLEDevice::setPower(ESP_PWR_LVL_P9);
         bleStarted = true;
-        LOGI(TAG, "NimBLE started");
         delay(500);
+        LOGI(TAG, "NimBLE OK. Heap: %u", ESP.getFreeHeap());
     }
 
-    for (int attempt = 1; attempt <= BT_CONNECT_RETRIES; attempt++) {
-        LOGI(TAG, "BLE attempt %d/%d", attempt, BT_CONNECT_RETRIES);
-
-        // Очистка
-        if (pBleClient) {
-            if (pBleClient->isConnected()) {
-                pBleClient->disconnect();
-                delay(500);
-            }
-            NimBLEDevice::deleteClient(pBleClient);
-            pBleClient = nullptr;
-            pBleRxChar = nullptr;
-            delay(300);
+    // Очистка предыдущего клиента
+    if (pClient) {
+        if (pClient->isConnected()) {
+            pClient->disconnect();
+            delay(500);
         }
-
-        pBleClient = NimBLEDevice::createClient();
-        pBleClient->setClientCallbacks(&bleCallbacks, false);
-        pBleClient->setConnectTimeout(10);
-
-        LOGD(TAG, "Trying PUBLIC...");
-        bool connected = pBleClient->connect(
-            NimBLEAddress(macBuf, BLE_ADDR_PUBLIC));
-
-        if (!connected) {
-            LOGD(TAG, "PUBLIC fail, trying RANDOM...");
-            NimBLEDevice::deleteClient(pBleClient);
-            delay(200);
-            pBleClient = NimBLEDevice::createClient();
-            pBleClient->setClientCallbacks(&bleCallbacks, false);
-            pBleClient->setConnectTimeout(10);
-            connected = pBleClient->connect(
-                NimBLEAddress(macBuf, BLE_ADDR_RANDOM));
-        }
-
-        if (!connected) {
-            LOGW(TAG, "BLE link failed (attempt %d)", attempt);
-            NimBLEDevice::deleteClient(pBleClient);
-            pBleClient = nullptr;
-            delay(BT_RETRY_DELAY_MS);
-            continue;
-        }
-
-        LOGI(TAG, "BLE link OK");
-        delay(500);
-
-        // Перечисляем сервисы
-        auto* svcs = pBleClient->getServices(true);
-        if (svcs) {
-            LOGI(TAG, "Services (%d):", svcs->size());
-            for (auto& s : *svcs) {
-                LOGI(TAG, "  %s", s->getUUID().toString().c_str());
-            }
-        }
-
-        auto* svc = pBleClient->getService(NUS_SVC_UUID);
-        if (!svc) {
-            LOGE(TAG, "NUS service not found!");
-            pBleClient->disconnect();
-            NimBLEDevice::deleteClient(pBleClient);
-            pBleClient = nullptr;
-            delay(BT_RETRY_DELAY_MS);
-            continue;
-        }
-
-        pBleRxChar = svc->getCharacteristic(NUS_RX_UUID);
-        if (!pBleRxChar) {
-            LOGE(TAG, "RX char not found!");
-            pBleClient->disconnect();
-            NimBLEDevice::deleteClient(pBleClient);
-            pBleClient = nullptr;
-            delay(BT_RETRY_DELAY_MS);
-            continue;
-        }
-
-        LOGI(TAG, "RX char OK (props=0x%02X)", pBleRxChar->getProperties());
-
-        g_printerConnected = true;
-        delay(500);
-        raster_init();
-        delay(500);
-
-        if (pBleClient->isConnected()) {
-            LOGI(TAG, "Printer ready (BLE)");
-            return true;
-        }
-
-        LOGW(TAG, "Dropped after init");
-        g_printerConnected = false;
-        pBleRxChar = nullptr;
-        delay(BT_RETRY_DELAY_MS);
+        NimBLEDevice::deleteClient(pClient);
+        pClient = nullptr;
+        pWriteChar = nullptr;
+        delay(300);
     }
 
-    LOGE(TAG, "All BLE attempts failed");
+    // Создаём клиент
+    pClient = NimBLEDevice::createClient();
+    pClient->setClientCallbacks(&bleCallbacks, false);
+    pClient->setConnectTimeout(15);
+
+    // ── PUBLIC → RANDOM ──
+    LOGI(TAG, "Trying PUBLIC...");
+    bool connected = pClient->connect(NimBLEAddress(macBuf, BLE_ADDR_PUBLIC));
+
+    if (!connected) {
+        LOGI(TAG, "PUBLIC fail, trying RANDOM...");
+        NimBLEDevice::deleteClient(pClient);
+        delay(300);
+        pClient = NimBLEDevice::createClient();
+        pClient->setClientCallbacks(&bleCallbacks, false);
+        pClient->setConnectTimeout(15);
+        connected = pClient->connect(NimBLEAddress(macBuf, BLE_ADDR_RANDOM));
+    }
+
+    if (!connected) {
+        LOGE(TAG, "Connection failed!");
+        LOGE(TAG, "  Check: printer ON? MAC correct?");
+        NimBLEDevice::deleteClient(pClient);
+        pClient = nullptr;
+        return false;
+    }
+
+    LOGI(TAG, "BLE link OK!");
+    delay(500);
+
+    // ── Перечисляем сервисы ──
+    LOGI(TAG, "Discovering services...");
+
+    // getServices() возвращает вектор по значению в некоторых версиях
+    std::vector<NimBLERemoteService*> svcList = pClient->getServices(true);
+
+    if (svcList.empty()) {
+        LOGE(TAG, "No services!");
+        pClient->disconnect();
+        NimBLEDevice::deleteClient(pClient);
+        pClient = nullptr;
+        return false;
+    }
+
+    LOGI(TAG, "Found %d services:", svcList.size());
+    for (auto* svc : svcList) {
+        LOGI(TAG, "  SVC: %s", svc->getUUID().toString().c_str());
+    }
+
+    // ── Ищем характеристику AE01 ──
+    pWriteChar = nullptr;
+    NimBLEUUID targetUUID(FP_WRITE_UUID);
+
+    for (auto* svc : svcList) {
+        std::vector<NimBLERemoteCharacteristic*> charList =
+            svc->getCharacteristics(true);
+
+        for (auto* ch : charList) {
+            LOGD(TAG, "    CHAR: %s",
+                 ch->getUUID().toString().c_str());
+
+            if (ch->getUUID().equals(targetUUID)) {
+                pWriteChar = ch;
+                LOGI(TAG, "  >>> Found AE01 in %s",
+                     svc->getUUID().toString().c_str());
+                break;
+            }
+        }
+        if (pWriteChar) break;
+    }
+
+    // ── Fallback: NUS RX ──
+    if (!pWriteChar) {
+        LOGW(TAG, "AE01 not found, trying NUS (6E400002)...");
+        NimBLEUUID nusRxUUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+
+        for (auto* svc : svcList) {
+            std::vector<NimBLERemoteCharacteristic*> charList =
+                svc->getCharacteristics(true);
+
+            for (auto* ch : charList) {
+                if (ch->getUUID().equals(nusRxUUID)) {
+                    pWriteChar = ch;
+                    LOGI(TAG, "  >>> Found NUS RX fallback");
+                    break;
+                }
+            }
+            if (pWriteChar) break;
+        }
+    }
+
+    if (!pWriteChar) {
+        LOGE(TAG, "No writable char found!");
+        LOGE(TAG, "Available characteristics:");
+        for (auto* svc : svcList) {
+            std::vector<NimBLERemoteCharacteristic*> charList =
+                svc->getCharacteristics(true);
+            for (auto* ch : charList) {
+                LOGE(TAG, "  %s in %s",
+                     ch->getUUID().toString().c_str(),
+                     svc->getUUID().toString().c_str());
+            }
+        }
+        pClient->disconnect();
+        NimBLEDevice::deleteClient(pClient);
+        pClient = nullptr;
+        return false;
+    }
+
+    LOGI(TAG, "Write char ready: %s",
+         pWriteChar->getUUID().toString().c_str());
+
+    g_printerConnected = true;
+    delay(500);
+    raster_init();
+    delay(300);
+
+    if (pClient->isConnected()) {
+        LOGI(TAG, "Printer ready! Heap: %u", ESP.getFreeHeap());
+        return true;
+    }
+
+    LOGW(TAG, "Dropped after init");
     g_printerConnected = false;
+    pWriteChar = nullptr;
     return false;
 }
 
+// =============================================================================
 void bt_disconnect() {
-    LOGI(TAG, "BLE disconnect");
-    if (bleStarted && pBleClient && pBleClient->isConnected()) {
-        pBleClient->disconnect();
+    LOGI(TAG, "Disconnecting...");
+    if (bleStarted && pClient && pClient->isConnected()) {
+        pClient->disconnect();
     }
-    pBleRxChar = nullptr;
+    pWriteChar = nullptr;
     g_printerConnected = false;
     delay(500);
-    LOGI(TAG, "Disconnected");
+    LOGI(TAG, "Done");
 }
 
-#endif
-
 // =============================================================================
-//  Растровые примитивы
+//  Протокол FunnyPrint
+//
+//  Строка растра: заголовок [12 2A 01 01] + 48 байт данных
+//  Каждый бит = 1 пиксель (MSB слева, 1 = чёрный)
+// =============================================================================
+
+static bool sendRasterLine(const uint8_t* lineData) {
+    uint8_t hdr[] = {0x12, 0x2A, 0x01, 0x01};
+    if (!bt_write(hdr, sizeof(hdr))) return false;
+    if (!bt_write(lineData, PRINTER_WIDTH_BYTES)) return false;
+    delay(BLE_LINE_DELAY_MS);
+    return true;
+}
+
 // =============================================================================
 void raster_init() {
     if (!g_printerConnected) return;
-    LOGD(TAG, "ESC @ init");
+    LOGD(TAG, "ESC @");
     const uint8_t cmd[] = {0x1B, 0x40};
     bt_write(cmd, 2);
     delay(100);
+}
+
+void raster_set_concentration(uint8_t level) {
+    if (!g_printerConnected) return;
+    if (level < 1) level = 1;
+    if (level > 6) level = 6;
+    LOGD(TAG, "Concentration %d", level);
+    uint8_t cmd[] = {0x1F, 0x11, 0x02, level};
+    bt_write(cmd, 4);
+    delay(50);
 }
 
 void raster_feed(uint8_t lines) {
@@ -359,20 +288,19 @@ void raster_feed(uint8_t lines) {
 
 void raster_empty(int heightPx) {
     if (!g_printerConnected || heightPx <= 0) return;
-    size_t sz = (size_t)PRINTER_WIDTH_BYTES * heightPx;
-    uint8_t* buf = (uint8_t*)calloc(sz, 1);
-    if (!buf) { LOGE(TAG, "OOM %d", heightPx); return; }
-    sendRasterBlock(buf, PRINTER_WIDTH_BYTES, heightPx);
-    free(buf);
+    uint8_t emptyLine[PRINTER_WIDTH_BYTES];
+    memset(emptyLine, 0, sizeof(emptyLine));
+    for (int y = 0; y < heightPx; y++) {
+        sendRasterLine(emptyLine);
+    }
 }
 
 void raster_separator(char style, uint8_t heightPx) {
     if (!g_printerConnected) return;
-    size_t sz = (size_t)PRINTER_WIDTH_BYTES * heightPx;
-    uint8_t* buf = (uint8_t*)calloc(sz, 1);
-    if (!buf) { LOGE(TAG, "OOM sep"); return; }
+    uint8_t line[PRINTER_WIDTH_BYTES];
 
     for (int y = 0; y < heightPx; y++) {
+        memset(line, 0, sizeof(line));
         for (int x = 0; x < PRINTER_WIDTH_PX; x++) {
             bool on = false;
             switch (style) {
@@ -380,13 +308,10 @@ void raster_separator(char style, uint8_t heightPx) {
                 case '=': on = (y == 0 || y == heightPx - 1); break;
                 default:  on = true; break;
             }
-            if (on) {
-                buf[y * PRINTER_WIDTH_BYTES + (x >> 3)] |= (0x80 >> (x & 7));
-            }
+            if (on) line[x >> 3] |= (0x80 >> (x & 7));
         }
+        sendRasterLine(line);
     }
-    sendRasterBlock(buf, PRINTER_WIDTH_BYTES, heightPx);
-    free(buf);
 }
 
 void raster_print_line(const char* text, uint8_t scale,
@@ -394,10 +319,7 @@ void raster_print_line(const char* text, uint8_t scale,
     if (!g_printerConnected || !text) return;
 
     int textLen = (int)strlen(text);
-    if (textLen == 0) {
-        raster_empty(FONT_CHAR_H * scale);
-        return;
-    }
+    if (textLen == 0) { raster_empty(FONT_CHAR_H * scale); return; }
 
     const int charW    = FONT_CHAR_W * scale;
     const int charH    = FONT_CHAR_H * scale;
@@ -410,76 +332,63 @@ void raster_print_line(const char* text, uint8_t scale,
     if (align == 2) offsetX = PRINTER_WIDTH_PX - textPx;
     if (offsetX < 0) offsetX = 0;
 
-    const int height = charH;
-    size_t rasterSz  = (size_t)PRINTER_WIDTH_BYTES * height;
-    uint8_t* raster  = (uint8_t*)calloc(rasterSz, 1);
-    if (!raster) { LOGE(TAG, "OOM %d", rasterSz); return; }
+    uint8_t line[PRINTER_WIDTH_BYTES];
 
-    for (int ci = 0; ci < textLen; ci++) {
-        const uint8_t* glyph = fontGlyph(text[ci]);
+    for (int py = 0; py < charH; py++) {
+        memset(line, 0, sizeof(line));
+        int fontRow = py / scale;
 
-        for (int row = 0; row < FONT_CHAR_H; row++) {
-            uint8_t fb = pgm_read_byte(&glyph[row]);
+        for (int ci = 0; ci < textLen; ci++) {
+            const uint8_t* glyph = fontGlyph(text[ci]);
+            uint8_t fb = pgm_read_byte(&glyph[fontRow]);
             if (bold) fb |= (fb >> 1);
 
             for (int col = 0; col < FONT_CHAR_W; col++) {
                 if (!((fb >> (7 - col)) & 1)) continue;
-
-                for (int sy = 0; sy < scale; sy++) {
-                    for (int sx = 0; sx < scale; sx++) {
-                        int px = offsetX + ci * charW + col * scale + sx;
-                        int py = row * scale + sy;
-                        if (px < 0 || px >= PRINTER_WIDTH_PX || py >= height)
-                            continue;
-                        raster[py * PRINTER_WIDTH_BYTES + (px >> 3)]
-                            |= (0x80 >> (px & 7));
+                for (int sx = 0; sx < scale; sx++) {
+                    int px = offsetX + ci * charW + col * scale + sx;
+                    if (px >= 0 && px < PRINTER_WIDTH_PX) {
+                        line[px >> 3] |= (0x80 >> (px & 7));
                     }
                 }
             }
         }
+        sendRasterLine(line);
     }
-
-    bool ok = sendRasterBlock(raster, PRINTER_WIDTH_BYTES, height);
-    free(raster);
-    if (!ok) LOGE(TAG, "print_line FAIL");
 }
 
 // =============================================================================
-//  Талон
-// =============================================================================
 void printTicket(const char* num, const char* queue, const char* eta) {
     if (!g_printerConnected || !bt_is_alive()) {
-        LOGE("PRN", "Cannot print: %s",
-             !g_printerConnected ? "not connected" : "link dead");
+        LOGE("PRN", "No connection");
         g_printerConnected = false;
         return;
     }
 
     LOGI("PRN", "=== TICKET %s ===", num);
-    LOGI("PRN", "  Queue: %s  ETA: %s  Heap: %u",
-         queue, (eta && eta[0]) ? eta : "-", ESP.getFreeHeap());
 
     raster_init();
     delay(200);
+    raster_set_concentration(4);
 
     raster_print_line("SMART QUEUE", 2, 1, true);
-    raster_empty(6);
+    raster_empty(4);
     raster_separator('-', 2);
-    raster_empty(6);
+    raster_empty(4);
     raster_print_line(queue, 1, 1, false);
-    raster_empty(6);
+    raster_empty(4);
     raster_print_line(num, 2, 1, true);
-    raster_empty(6);
+    raster_empty(4);
 
     if (eta && eta[0]) {
         char buf[64];
         snprintf(buf, sizeof(buf), "Wait: %s", eta);
         raster_print_line(buf, 1, 0, false);
-        raster_empty(6);
+        raster_empty(4);
     }
 
     raster_separator('-', 2);
     raster_feed(4);
 
-    LOGI("PRN", "=== DONE %s ===", num);
+    LOGI("PRN", "=== DONE ===");
 }

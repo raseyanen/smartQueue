@@ -2,18 +2,22 @@
 #include <Arduino.h>
 #include <GyverDBFile.h>
 
-#define FW_VERSION  "2.2.0"
+#define FW_VERSION  "2.3.0"
 
-// ─── Принтер ─────────────────────────────────────────────────────────────────
+// ─── Принтер FunnyPrint (BLE) ───────────────────────────────────────────────
+// Кастомный BLE UUID (НЕ NUS!)
+// Сервис: 0000AE30-0000-1000-8000-00805F9B34FB (или ищем по характеристике)
+// Характеристика записи: 0000AE01-0000-1000-8000-00805F9B34FB
+static const char FP_WRITE_UUID[] = "0000ae01-0000-1000-8000-00805f9b34fb";
+
 #define PRINTER_WIDTH_PX      384
-#define PRINTER_WIDTH_BYTES   48
-#define BLE_CHUNK_SIZE        20
-#define BLE_CHUNK_DELAY_MS    15      // консервативно
-#define SPP_CHUNK_SIZE        128     // маленькие блоки для стабильности
-#define SPP_CHUNK_DELAY_MS    10
-#define RASTER_BLOCK_HEIGHT   32      // ещё меньше — надёжнее
-#define BT_CONNECT_RETRIES    2       // 2 попытки (3 = долго и может крашить)
-#define BT_RETRY_DELAY_MS     2000    // 2 секунды между попытками
+#define PRINTER_WIDTH_BYTES   48     // 384 / 8
+#define BLE_CHUNK_SIZE        20     // MTU без negotiation
+#define BLE_CHUNK_DELAY_MS    10     // мс между чанками
+#define BLE_LINE_DELAY_MS     5      // мс между строками растра
+
+// Авто-реконнект
+#define BT_AUTO_RECONNECT_MS  30000UL
 
 // ─── Дефолты ─────────────────────────────────────────────────────────────────
 static const char DEFAULT_PRINTER_MAC[] = "AA:BB:CC:DD:EE:FF";
@@ -21,18 +25,15 @@ static const char DEFAULT_PRINTER_MAC[] = "AA:BB:CC:DD:EE:FF";
 
 static const char AP_SSID[] = "SmartQueue-Setup";
 static const char AP_PASS[] = "12345678";
-
-static const char BT_NAME_CLASSIC[] = "SmartQueue";
-static const char BT_NAME_BLE[]     = "SmartQueue-C3";
-
-static const char NUS_SVC_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-static const char NUS_RX_UUID[]  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char BT_NAME[] = "SmartQueue";
 
 // ─── Плата ───────────────────────────────────────────────────────────────────
+// Обе платы теперь используют BLE (принтер FunnyPrint = BLE-only)
 #if defined(BOARD_WROOM)
-    #define BT_CLASSIC 1
+    // ESP32 WROOM поддерживает BLE через NimBLE
+    #define BOARD_NAME "WROOM-32"
 #elif defined(BOARD_C3)
-    #define BT_CLASSIC 0
+    #define BOARD_NAME "C3"
 #else
     #error "Define -D BOARD_WROOM or -D BOARD_C3"
 #endif
@@ -54,7 +55,6 @@ static const char NUS_RX_UUID[]  = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 #define K_WEB_PASS       "web_pass"_h
 #define K_CONFIGURED     "configured"_h
 
-// ─── Глобалы ─────────────────────────────────────────────────────────────────
 extern bool        g_wifiConnected;
 extern bool        g_printerConnected;
 extern GyverDBFile g_db;

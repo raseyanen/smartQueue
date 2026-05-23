@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <WiFi.h>
-
 #include <GyverDBFile.h>
 #include <SettingsESP.h>
 
@@ -13,45 +12,22 @@
 #include "api_client.h"
 #include "web_ui.h"
 
-// ── Глобалы ──────────────────────────────────────────────────────────────────
 GyverDBFile g_db(&LittleFS, "/sq_config.db");
 SettingsESP sett("SmartQueue Terminal", &g_db);
 
 bool g_wifiConnected    = false;
 bool g_printerConnected = false;
 
-#if BT_CLASSIC
-    #include <BluetoothSerial.h>
-    BluetoothSerial SerialBT;
-#else
-    #include <NimBLEDevice.h>
-    NimBLEClient*                pBleClient = nullptr;
-    NimBLERemoteCharacteristic*  pBleRxChar = nullptr;
-#endif
+static unsigned long lastPoll     = 0;
+static unsigned long lastBtCheck  = 0;
+static unsigned long lastBtReconn = 0;
+static bool          btShouldConnect = false;
 
-static unsigned long lastPoll    = 0;
-static unsigned long lastBtCheck = 0;
-#define BT_CHECK_INTERVAL_MS  15000UL
-
-// Буфер для IP — чтобы не использовать временный String в printf
 static char ipBuf[20];
 
 static void updateIpBuf() {
-    if (g_wifiConnected) {
-        IPAddress ip = WiFi.localIP();
-        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    } else {
-        IPAddress ip = WiFi.softAPIP();
-        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    }
-}
-
-static void checkBtConnection() {
-    if (!g_printerConnected) return;
-    if (!bt_is_alive()) {
-        LOGW("MAIN", "Printer link lost");
-        g_printerConnected = false;
-    }
+    IPAddress ip = g_wifiConnected ? WiFi.localIP() : WiFi.softAPIP();
+    snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
 // =============================================================================
@@ -61,11 +37,8 @@ void setup() {
 
     log_init();
     LOGI("MAIN", "=== SmartQueue v%s ===", FW_VERSION);
-#if BT_CLASSIC
-    LOGI("MAIN", "WROOM-32 (SPP)");
-#else
-    LOGI("MAIN", "C3 (BLE NUS)");
-#endif
+    LOGI("MAIN", "Board: %s (BLE)", BOARD_NAME);
+    LOGI("MAIN", "Printer: FunnyPrint BLE (AE01)");
     LOGI("MAIN", "Heap: %u", ESP.getFreeHeap());
 
     if (!LittleFS.begin(true)) {
@@ -86,7 +59,6 @@ void setup() {
         if (pw[0]) sett.setPass(pw);
     }
 
-    // WiFi
     bool configured = (bool)g_db[K_CONFIGURED].toInt();
     char ssidTest[4] = {0};
     { auto v = g_db[K_SSID]; strncpy(ssidTest, v.toString().c_str(), 3); }
@@ -102,34 +74,32 @@ void setup() {
         }
     }
 
-    // Settings HTTP
     sett.begin();
 
-    // 404 handler — убирает спам "request handler not found"
     sett.server.onNotFound([]() {
-        sett.server.send(404, "text/plain", "Not Found");
+        sett.server.send(404, "text/plain", "404");
     });
 
-    // Лог-эндпоинты
     ui_register_log_endpoint();
 
-    // IP
     updateIpBuf();
     LOGI("MAIN", "Web: http://%s", ipBuf);
     LOGI("MAIN", "Log: http://%s/log", ipBuf);
 
-    // Принтер
     if (configured) {
         char macCheck[20] = {0};
         { auto v = g_db[K_BT_MAC]; strncpy(macCheck, v.toString().c_str(), 19); }
 
         if (strcmp(macCheck, DEFAULT_PRINTER_MAC) == 0 || strlen(macCheck) < 17) {
-            LOGW("MAIN", "MAC is default, skip printer");
+            LOGW("MAIN", "MAC is default - set in web UI");
         } else {
+            btShouldConnect = true;
             LOGI("MAIN", "Connecting printer %s", macCheck);
             bt_connect();
             if (g_printerConnected) {
-                raster_print_line("SmartQueue v2.2", 1, 1, true);
+                raster_set_concentration(4);
+                raster_print_line("SmartQueue v2.3", 1, 1, true);
+                raster_print_line("FunnyPrint BLE", 1, 1, false);
                 raster_print_line("Ready", 1, 1, false);
                 raster_feed(2);
             }
@@ -140,7 +110,7 @@ void setup() {
         g_db[K_CONFIGURED] = (uint8_t)1;
     }
 
-    LOGI("MAIN", "Setup done. Heap: %u", ESP.getFreeHeap());
+    LOGI("MAIN", "Done. Heap: %u", ESP.getFreeHeap());
 }
 
 // =============================================================================
@@ -153,9 +123,19 @@ void loop() {
         api_poll();
     }
 
-    if (millis() - lastBtCheck >= BT_CHECK_INTERVAL_MS) {
+    if (millis() - lastBtCheck >= 15000UL) {
         lastBtCheck = millis();
-        checkBtConnection();
+        if (g_printerConnected && !bt_is_alive()) {
+            LOGW("MAIN", "Printer link lost");
+            g_printerConnected = false;
+        }
+    }
+
+    if (btShouldConnect && !g_printerConnected &&
+        millis() - lastBtReconn >= BT_AUTO_RECONNECT_MS) {
+        lastBtReconn = millis();
+        LOGI("MAIN", "Auto-reconnect...");
+        bt_connect();
     }
 
     yield();
