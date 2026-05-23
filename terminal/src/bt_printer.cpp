@@ -246,10 +246,17 @@ bool bt_connect() {
 
     // Init принтера
     LOGI(TAG, "Sending ESC @...");
+    g_printerConnected = true;
+    LOGI(TAG, "BLE link OK! MTU=%u", pClient->getMTU());
+    delay(500);
+
+    // ── Инициализация принтера ──
+    LOGI(TAG, "Sending ESC @...");
     const uint8_t initCmd[] = {0x1B, 0x40};
-    if (!pWriteChar->writeValue(initCmd, 2, useResponse)) {
-        LOGW(TAG, "Init write failed (trying without response)");
-        pWriteChar->writeValue(initCmd, 2, false);
+    // ⚠️ ВАЖНО: используем response=false
+    if (!pWriteChar->writeValue(initCmd, 2, false)) {
+        LOGW(TAG, "Init send failed");
+        // Не критично — продолжаем
     }
     delay(300);
 
