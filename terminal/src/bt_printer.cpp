@@ -14,6 +14,17 @@ static bool bleStarted = false;
 // Найденный UUID характеристики (для логирования)
 static char foundCharUUID[48] = {0};
 
+// Уменьшенный размер чанка для стабильности
+#ifndef BLE_CHUNK_SIZE
+#define BLE_CHUNK_SIZE 20
+#endif
+#ifndef BLE_CHUNK_DELAY_MS
+#define BLE_CHUNK_DELAY_MS 15
+#endif
+#ifndef BLE_LINE_DELAY_MS
+#define BLE_LINE_DELAY_MS 20
+#endif
+
 // =============================================================================
 //  Список кандидатов для записи (в порядке приоритета)
 //  Добавляем все известные UUID принтеров этого класса
@@ -55,10 +66,22 @@ bool bt_write(const uint8_t* d, size_t n) {
         return false;
     }
 
+    // Для характеристики 0xffe1 используем write without response (true)
+    bool useNoResponse = pWriteChar->canWriteNoResponse();
+
     for (size_t off = 0; off < n; off += BLE_CHUNK_SIZE) {
         size_t chunk = min((size_t)BLE_CHUNK_SIZE, n - off);
-        if (!pWriteChar->writeValue(d + off, chunk, false)) {
-            LOGE(TAG, "Write err at %u", off);
+        // Пробуем записать с повторами при ошибке
+        bool ok = false;
+        for (int retry = 0; retry < 3 && !ok; retry++) {
+            ok = pWriteChar->writeValue(d + off, chunk, useNoResponse);
+            if (!ok) {
+                LOGW(TAG, "Write retry %d at %u", retry + 1, off);
+                delay(10);
+            }
+        }
+        if (!ok) {
+            LOGE(TAG, "Write failed at %u after retries", off);
             return false;
         }
         delay(BLE_CHUNK_DELAY_MS);
@@ -236,18 +259,26 @@ bool bt_connect() {
          pWriteChar->canWrite() ? 1 : 0,
          pWriteChar->canWriteNoResponse() ? 1 : 0);
 
-    g_printerConnected = true;
-    delay(500);
-
     // ── Инициализация принтера ──
     LOGI(TAG, "Sending ESC @...");
     const uint8_t initCmd[] = {0x1B, 0x40};
-    // ⚠️ ВАЖНО: используем response=false
-    if (!pWriteChar->writeValue(initCmd, 2, false)) {
-        LOGW(TAG, "Init send failed");
-        // Не критично — продолжаем
+    // ⚠️ ВАЖНО: используем write without response для стабильности
+    bool useNoResponse = pWriteChar->canWriteNoResponse();
+    bool initOk = false;
+    for (int retry = 0; retry < 3 && !initOk; retry++) {
+        initOk = pWriteChar->writeValue(initCmd, 2, useNoResponse);
+        if (!initOk) {
+            LOGW(TAG, "Init retry %d", retry + 1);
+            delay(50);
+        }
+    }
+    if (!initOk) {
+        LOGW(TAG, "Init send failed after retries");
     }
     delay(300);
+
+    g_printerConnected = true;
+    delay(500);
 
     if (pClient->isConnected()) {
         LOGI(TAG, "Printer READY! Char=%s Heap=%u",
