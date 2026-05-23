@@ -46,7 +46,7 @@
     <div class="card mb-4">
         <div class="card-header d-flex justify-content-between align-items-center">
             <h5 class="mb-0">Мои очереди</h5>
-            <a href="{% url 'queues:create_queue' %}" class="btn btn-sm btn-primary">Создать очередь</a>
+            <a href="{% url 'queues:queue_create' %}" class="btn btn-sm btn-primary">Создать очередь</a>
         </div>
         <div class="card-body">
             {% if owned_queues %}

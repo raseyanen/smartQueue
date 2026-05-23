@@ -57,13 +57,15 @@ class Ticket(models.Model):
     def save(self, *args, **kwargs):
         if not self.ticket_hash:
             # Генерация хеша на основе всех данных талона
-            hash_data = f"{self.queue.id}:{self.number}:{self.ticket_type}:{self.created_at.timestamp()}"
+            timestamp = self.created_at.timestamp() if self.created_at else timezone.now().timestamp()
+            hash_data = f"{self.queue.id}:{self.number}:{self.ticket_type}:{timestamp}"
             self.ticket_hash = hashlib.sha256(hash_data.encode()).hexdigest()
         super().save(*args, **kwargs)
     
     def verify_hash(self):
         """Проверка целостности хеша талона"""
-        hash_data = f"{self.queue.id}:{self.number}:{self.ticket_type}:{self.created_at.timestamp()}"
+        timestamp = self.created_at.timestamp() if self.created_at else timezone.now().timestamp()
+        hash_data = f"{self.queue.id}:{self.number}:{self.ticket_type}:{timestamp}"
         expected_hash = hashlib.sha256(hash_data.encode()).hexdigest()
         return self.ticket_hash == expected_hash
 
