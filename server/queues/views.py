@@ -8,7 +8,6 @@ from django.views.decorators.csrf import csrf_exempt
 from django.core.exceptions import PermissionDenied
 import json
 from .models import Queue, Ticket, Terminal, QueueExchange, Notification, Ban, IPAddressLog
-from queues.views.dashboard_views import dashboard
 
 
 def get_client_ip(request):
