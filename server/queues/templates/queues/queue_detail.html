@@ -1,0 +1,219 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ queue.name }} - Smart Queue{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="h3 mb-0">
+        <span class="live-indicator"></span>{{ queue.name }}
+        {% if is_owner %}
+            <span class="badge bg-success ms-2"><i class="bi bi-shield-check"></i> Вы владелец</span>
+        {% endif %}
+    </h1>
+</div>
+
+<p class="text-muted">{{ queue.description|default:"Очередь без описания" }}</p>
+
+<div class="card bg-light border-0 mb-4">
+    <div class="card-body">
+        <h6 class="card-subtitle mb-2 text-muted">Ссылка для входа в очередь:</h6>
+        <code class="fs-6">{{ request.scheme }}://{{ request.get_host }}{% url 'queues:queue_detail' queue.link %}</code>
+    </div>
+</div>
+
+<!-- Статистика очереди -->
+<div class="row g-3 mb-4">
+    <div class="col-md-4">
+        <div class="card shadow-sm">
+            <div class="card-body text-center">
+                <i class="bi bi-people display-6 text-primary"></i>
+                <h5 class="mt-2 mb-0" id="totalActive">-</h5>
+                <small class="text-muted">Участников в очереди</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow-sm">
+            <div class="card-body text-center">
+                <i class="bi bi-clock display-6 text-info"></i>
+                <h5 class="mt-2 mb-0">2 мин</h5>
+                <small class="text-muted">Среднее время обслуживания</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card shadow-sm">
+            <div class="card-body text-center">
+                <i class="bi bi-graph-up display-6 text-success"></i>
+                <h5 class="mt-2 mb-0">Live</h5>
+                <small class="text-muted">Автообновление 5 сек</small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Информация о талоне пользователя -->
+{% if user_ticket and not user_ticket.is_cancelled %}
+<div class="card border-primary shadow-sm mb-4">
+    <div class="card-header bg-primary text-white">
+        <i class="bi bi-ticket-perforated"></i> Ваш талон
+    </div>
+    <div class="card-body text-center">
+        <div class="ticket-number">№{{ user_ticket.number }}</div>
+        <p class="lead">Вы в очереди! Ожидайте своего номера.</p>
+        <div class="row g-3 justify-content-center">
+            <div class="col-md-4">
+                <div class="p-3 bg-light rounded">
+                    <small class="text-muted">Ваша позиция</small>
+                    <div><span class="position-badge fs-5" id="yourPosition">Загрузка...</span></div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="p-3 bg-light rounded">
+                    <small class="text-muted">Время ожидания</small>
+                    <div><span class="wait-time fs-5" id="yourWaitTime">Загрузка...</span></div>
+                </div>
+            </div>
+        </div>
+        <form action="{% url 'queues:leave_queue' queue.link %}" method="post" class="mt-4">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-warning">
+                <i class="bi bi-box-arrow-right"></i> Выйти из очереди
+            </button>
+        </form>
+    </div>
+</div>
+{% elif user.is_authenticated and not user_ticket %}
+<div class="card shadow-sm mb-4">
+    <div class="card-body text-center py-4">
+        <i class="bi bi-person-plus display-4 text-success mb-3"></i>
+        <h4>Хотите присоединиться к очереди?</h4>
+        <form action="{% url 'queues:join_queue' queue.link %}" method="post" class="d-inline">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-success btn-lg">
+                <i class="bi bi-plus-lg"></i> Занять место в очереди
+            </button>
+        </form>
+    </div>
+</div>
+{% elif not user.is_authenticated %}
+<div class="alert alert-info">
+    <i class="bi bi-info-circle"></i> <a href="{% url 'accounts:login' %}" class="alert-link">Войдите</a>, чтобы занять место в очереди.
+</div>
+{% endif %}
+
+<!-- Таблица участников -->
+<div class="card shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-list-ul"></i> Участники очереди</span>
+        <span class="badge bg-secondary">Обновляется автоматически</span>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0" id="ticketsTable">
+                <thead class="table-light">
+                    <tr>
+                        <th>Позиция</th>
+                        <th>Номер</th>
+                        <th>Пользователь</th>
+                        <th>Время получения</th>
+                        <th>Время ожидания</th>
+                        {% if is_owner %}<th>Действия</th>{% endif %}
+                    </tr>
+                </thead>
+                <tbody id="ticketsBody">
+                    <tr>
+                        <td colspan="{% if is_owner %}6{% else %}5{% endif %}" class="text-center py-4">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Загрузка...</span>
+                            </div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    const queueLink = "{{ queue.link }}";
+    const apiEndpoint = "{% url 'queues:queue_data_api' queue.link %}";
+    const isOwner = {{ is_owner|yesno:"true,false" }};
+    const userTicketNumber = {{ user_ticket.number|default:"null" }};
+
+    function formatTime(minutes) {
+        if (minutes === 0) return "Сейчас";
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        if (hours > 0) {
+            return `${hours}ч ${mins}мин`;
+        }
+        return `${mins} мин`;
+    }
+
+    function updateQueueData() {
+        fetch(apiEndpoint)
+            .then(response => response.json())
+            .then(data => {
+                // Обновляем статистику
+                document.getElementById('totalActive').textContent = data.total_active;
+                
+                // Обновляем таблицу
+                const tbody = document.getElementById('ticketsBody');
+                tbody.innerHTML = '';
+                
+                if (data.tickets.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="${isOwner ? 6 : 5}" class="text-center py-4 text-muted">Пока нет участников в очереди.</td></tr>`;
+                } else {
+                    data.tickets.forEach(ticket => {
+                        const row = document.createElement('tr');
+                        let actionsHtml = '';
+                        if (isOwner) {
+                            const cancelUrl = "{% url 'queues:cancel_ticket' 0 %}".replace('/0/', '/' + ticket.id + '/');
+                            actionsHtml = `
+                                <td>
+                                    <form action="${cancelUrl}" method="post" style="display: inline;">
+                                        {% csrf_token %}
+                                        <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Аннулировать талон №' + ticket.number + '?')">
+                                            <i class="bi bi-x-lg"></i> Аннулировать
+                                        </button>
+                                    </form>
+                                </td>
+                            `;
+                        }
+                        
+                        row.innerHTML = `
+                            <td><span class="position-badge">${ticket.position}</span></td>
+                            <td><strong>№${ticket.number}</strong></td>
+                            <td>${ticket.username}</td>
+                            <td>${ticket.created_at}</td>
+                            <td class="wait-time">${formatTime(ticket.wait_time_minutes)}</td>
+                            ${actionsHtml}
+                        `;
+                        tbody.appendChild(row);
+                    });
+                }
+                
+                // Обновляем информацию о пользователе
+                if (userTicketNumber !== null) {
+                    const userTicket = data.tickets.find(t => t.number === userTicketNumber);
+                    if (userTicket) {
+                        document.getElementById('yourPosition').textContent = userTicket.position;
+                        document.getElementById('yourWaitTime').textContent = formatTime(userTicket.wait_time_minutes);
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Ошибка обновления данных:', error);
+            });
+    }
+
+    // Первоначальная загрузка данных
+    updateQueueData();
+    
+    // Автообновление каждые 5 секунд
+    setInterval(updateQueueData, 5000);
+</script>
+{% endblock %}

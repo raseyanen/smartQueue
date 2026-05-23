@@ -1,0 +1,51 @@
+{% extends 'base.html' %}
+
+{% block title %}Мои очереди - Smart Queue{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="h3 mb-0"><i class="bi bi-list-task"></i> Мои очереди</h1>
+    <a href="{% url 'queues:queue_create' %}" class="btn btn-primary">
+        <i class="bi bi-plus-lg"></i> Создать очередь
+    </a>
+</div>
+
+{% if owned_queues %}
+    <div class="row g-4">
+        {% for queue in owned_queues %}
+        <div class="col-md-6 col-lg-4">
+            <div class="card queue-card h-100 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <i class="bi bi-people-fill text-primary"></i> {{ queue.name }}
+                    </h5>
+                    {% if queue.description %}
+                        <p class="card-text text-muted">{{ queue.description|truncatewords:10 }}</p>
+                    {% endif %}
+                    <div class="mb-3">
+                        <span class="badge bg-secondary">
+                            <i class="bi bi-link-45deg"></i> {{ queue.link }}
+                        </span>
+                        <span class="badge bg-info">
+                            <i class="bi bi-people"></i> {{ queue.active_participants_count }} участн.
+                        </span>
+                    </div>
+                    <a href="{% url 'queues:queue_detail' queue.link %}" class="btn btn-success btn-sm">
+                        <i class="bi bi-eye"></i> Открыть очередь
+                    </a>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+{% else %}
+    <div class="text-center py-5">
+        <i class="bi bi-inbox display-1 text-muted"></i>
+        <h3 class="mt-3">У вас пока нет очередей</h3>
+        <p class="text-muted">Создайте свою первую очередь прямо сейчас!</p>
+        <a href="{% url 'queues:queue_create' %}" class="btn btn-primary btn-lg">
+            <i class="bi bi-plus-lg"></i> Создать очередь
+        </a>
+    </div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,138 @@
+{% extends 'base.html' %}
+
+{% block title %}Результат проверки талона{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            {% if ticket %}
+                <!-- Талон найден -->
+                <div class="card {% if ticket.is_cancelled %}border-danger{% elif ticket.print_confirmed %}border-success{% else %}border-warning{% endif %}">
+                    <div class="card-header {% if ticket.is_cancelled %}bg-danger{% elif ticket.print_confirmed %}bg-success{% else %}bg-warning{% endif %} text-white">
+                        <h4 class="mb-0">
+                            {% if ticket.is_cancelled %}
+                                <i class="bi bi-x-circle"></i> Талон аннулирован
+                            {% elif ticket.print_confirmed %}
+                                <i class="bi bi-check-circle"></i> Талон действителен
+                            {% else %}
+                                <i class="bi bi-exclamation-triangle"></i> Талон ожидает подтверждения
+                            {% endif %}
+                        </h4>
+                    </div>
+                    <div class="card-body">
+                        <div class="row mb-3">
+                            <div class="col-md-6">
+                                <h5>Информация о талоне</h5>
+                                <table class="table table-sm">
+                                    <tr>
+                                        <th>Номер:</th>
+                                        <td><strong>{{ ticket.get_ticket_type_display }}{{ ticket.number }}</strong></td>
+                                    </tr>
+                                    <tr>
+                                        <th>Очередь:</th>
+                                        <td>{{ ticket.queue.name }}</td>
+                                    </tr>
+                                    <tr>
+                                        <th>Тип:</th>
+                                        <td>
+                                            {% if ticket.ticket_type == 'T' %}
+                                                <span class="badge bg-secondary">Терминал</span>
+                                            {% else %}
+                                                <span class="badge bg-primary">Сайт</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <th>Дата получения:</th>
+                                        <td>{{ ticket.created_at|date:"d.m.Y H:i:s" }}</td>
+                                    </tr>
+                                </table>
+                            </div>
+                            <div class="col-md-6">
+                                <h5>Статус очереди</h5>
+                                <table class="table table-sm">
+                                    <tr>
+                                        <th>Текущий номер:</th>
+                                        <td>
+                                            {% if current_number %}
+                                                {{ current_number }}
+                                            {% else %}
+                                                <span class="text-muted">Нет активных талонов</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <th>Ваше место:</th>
+                                        <td>
+                                            {% if position %}
+                                                {% if position == 1 %}
+                                                    <span class="badge bg-success">Сейчас!</span>
+                                                {% else %}
+                                                    <span class="badge bg-info">{{ position }} в очереди</span>
+                                                {% endif %}
+                                            {% else %}
+                                                <span class="text-muted">Неизвестно</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <th>Статус талона:</th>
+                                        <td>
+                                            {% if ticket.is_cancelled %}
+                                                <span class="badge bg-danger">Аннулирован</span>
+                                            {% elif ticket.print_confirmed %}
+                                                <span class="badge bg-success">Подтверждён</span>
+                                            {% else %}
+                                                <span class="badge bg-warning">Ожидает печати</span>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                </table>
+                            </div>
+                        </div>
+                        
+                        <div class="alert alert-info">
+                            <strong>Хеш талона:</strong>
+                            <code class="d-block mt-2">{{ ticket.ticket_hash }}</code>
+                        </div>
+                        
+                        <div class="text-center mt-4">
+                            <a href="{% url 'queues:queue_detail' ticket.queue.link %}" class="btn btn-primary">
+                                Перейти к очереди
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            {% else %}
+                <!-- Талон не найден -->
+                <div class="card border-danger">
+                    <div class="card-header bg-danger text-white">
+                        <h4 class="mb-0"><i class="bi bi-x-circle"></i> Талон не найден</h4>
+                    </div>
+                    <div class="card-body">
+                        <p class="lead">Талон с таким хешем не существует или был удалён.</p>
+                        <p class="text-muted">Возможные причины:</p>
+                        <ul>
+                            <li>Неверно введён хеш</li>
+                            <li>Талон был аннулирован владельцем очереди</li>
+                            <li>Талон уже отслужил и архивирован</li>
+                        </ul>
+                        <div class="text-center mt-4">
+                            <a href="{% url 'queues:verify_ticket' %}" class="btn btn-primary">
+                                Проверить другой талон
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            {% endif %}
+            
+            <div class="text-center mt-4">
+                <a href="{% url 'queues:verify_ticket' %}" class="btn btn-outline-secondary">
+                    <i class="bi bi-arrow-left"></i> Вернуться к проверке
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
