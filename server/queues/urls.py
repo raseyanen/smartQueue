@@ -6,6 +6,7 @@ app_name = 'queues'
 urlpatterns = [
     # Главные страницы
     path('', views.queue_list, name='queue_list'),
+    path('dashboard/', views.dashboard, name='dashboard'),
     path('create/', views.queue_create, name='queue_create'),
 
     # Проверка талона
