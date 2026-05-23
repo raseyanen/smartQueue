@@ -1,5 +1,5 @@
 /*
- * SmartQueue Terminal - ESP32-C3 SuperMicro
+ * SmartQueue Terminal - ESP32-WROOM-32
  */
 
 #include <Arduino.h>
@@ -13,17 +13,18 @@
 #include <GyverButton.h>
 #include <GSON.h>
 #include <mString.h>
-#include <BluetoothSerial.h>
 
 #define VERSION "1.0.0"
-#define DEFAULT_BTN_PIN 9
-#define DEFAULT_LED_PIN 8
-#define DEFAULT_OLED_SDA 6
-#define DEFAULT_OLED_SCL 7
+// Pin configuration for ESP32-WROOM-32
+#define DEFAULT_BTN_PIN 15      // GPIO 15
+#define DEFAULT_LED_PIN 2       // GPIO 2 (built-in LED on most boards)
+#define DEFAULT_OLED_SDA 21     // GPIO 21 (I2C SDA)
+#define DEFAULT_OLED_SCL 22     // GPIO 22 (I2C SCL)
+#define PRINTER_RX 16           // GPIO 16 (Bluetooth not used for printer on WROOM)
+#define PRINTER_TX 17           // GPIO 17
 
 GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
 GyverButton btn(DEFAULT_BTN_PIN);
-BluetoothSerial BT;
 WebServer server(80);
 
 struct Config {
@@ -181,12 +182,10 @@ void loop() {
                 ticketPending = true;
                 oledShowTicket(pendingTicketNumber, "T");
                 ledBlink(5, 100);
-                if (BT.connected()) {
-                    mString hash = config.terminalHash;
-                    mString queueName = config.queueLink;
-                    if (printerPrintTicket(pendingTicketNumber, "T", queueName.c_str(), hash.c_str()))
-                        oledShowStatus("Printed - Press to confirm");
-                }
+                mString hash = config.terminalHash;
+                mString queueName = config.queueLink;
+                if (printerPrintTicket(pendingTicketNumber, "T", queueName.c_str(), hash.c_str()))
+                    oledShowStatus("Printed - Press to confirm");
             } else {
                 oledShowStatus("Get ticket failed");
                 ledBlink(2, 300);
@@ -242,19 +241,20 @@ void startApMode() {
 }
 
 bool printerConnect() {
-    if (!BT.begin("SmartQueuePrinter")) { Serial.println("BT init failed"); return false; }
-    Serial.println("BT initialized"); return true;
+    // For ESP32-WROOM-32, using HardwareSerial for thermal printer via UART
+    Serial2.begin(9600, SERIAL_8N1, PRINTER_RX, PRINTER_TX);
+    Serial.println("UART Printer initialized on Serial2");
+    return true;
 }
 
 bool printerPrintTicket(int number, const char* type, const char* queueName, const char* hash) {
-    if (!BT.connected()) { Serial.println("Printer not connected"); return false; }
     mString receipt = "";
     receipt += "\x1B\x40"; receipt += "\x1B\x61\x01";
     receipt += "SMARTQUEUE\n----------------\nQueue: "; receipt += queueName; receipt += "\n";
     receipt += "\x1B\x21\x30"; receipt += "TALON: "; receipt += type; receipt += String(number); receipt += "\n";
     receipt += "\x1B\x21\x00"; receipt += "Date: "; receipt += __DATE__; receipt += " "; receipt += __TIME__; receipt += "\n";
     receipt += "Hash: "; receipt += hash; receipt += "\n----------------\n\x1B\x64\x03";
-    BT.print(receipt.c_str()); delay(1000); return true;
+    Serial2.print(receipt.c_str()); delay(1000); return true;
 }
 
 int getTicketFromServer() {
