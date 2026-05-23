@@ -1,76 +1,30 @@
 ```
-# Build artifacts
+# PlatformIO build artifacts
 .piolibdeps/
 .platformio/
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
 
 # Dependencies
 lib/
-deps/
 
-# Logs
+# Logs and temp files
 *.log
+*.tmp
 
 # Environment
 .env
 .env.local
 *.env.*
 
-# Editor/IDE
+# Editors
 .vscode/
 .idea/
-*.swp
-*.swo
-*.tmp
 
-# OS
+# OS specific
 .DS_Store
 Thumbs.db
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg-info/
-.eggs/
-
-# Compiled
-*.o
-*.obj
-*.a
-*.lib
-*.dll
-*.so
-*.dylib
-*.exe
-*.out
-
-# Archives
-*.zip
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.gz
-*.tgz
-*.rar
-*.7z
-*.bz2
-*.xz
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
 ```
