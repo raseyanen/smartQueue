@@ -236,18 +236,7 @@ bool bt_connect() {
          pWriteChar->canWrite() ? 1 : 0,
          pWriteChar->canWriteNoResponse() ? 1 : 0);
 
-    // Выбираем режим записи (with/without response)
-    // Если canWrite — используем response=true для надёжности
-    // Если только canWriteNoResponse — без response
-    bool useResponse = pWriteChar->canWrite();
-
     g_printerConnected = true;
-    delay(500);
-
-    // Init принтера
-    LOGI(TAG, "Sending ESC @...");
-    g_printerConnected = true;
-    LOGI(TAG, "BLE link OK! MTU=%u", pClient->getMTU());
     delay(500);
 
     // ── Инициализация принтера ──
