@@ -8,7 +8,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.core.exceptions import PermissionDenied
 import json
 from .models import Queue, Ticket, Terminal, QueueExchange, Notification, Ban, IPAddressLog
-from queues.views.dashboard_views import dashboard
+from .views.dashboard_views import dashboard
 
 
 def get_client_ip(request):
@@ -37,6 +37,61 @@ def check_user_banned(user, queue):
     if Ban.objects.filter(queue__owner=queue.owner, user=user, scope='owner').exists():
         return True
     return False
+
+
+def verify_ticket_form(request):
+    """Форма для ввода хеша талона на проверку"""
+    return render(request, 'queues/verify_ticket_form.html')
+
+
+def verify_ticket_result(request):
+    """Результат проверки талона по хешу"""
+    ticket_hash = request.GET.get('hash', '')
+    
+    if not ticket_hash:
+        return render(request, 'queues/verify_ticket_result.html', {
+            'valid': False,
+            'error': 'Хеш талона не указан'
+        })
+    
+    try:
+        # Ищем активный талон
+        ticket = Ticket.objects.filter(ticket_hash=ticket_hash).first()
+        
+        if not ticket:
+            # Ищем в завершенных
+            from .models import CompletedTicket
+            ticket = CompletedTicket.objects.filter(ticket_hash=ticket_hash).first()
+            if ticket:
+                return render(request, 'queues/verify_ticket_result.html', {
+                    'ticket': ticket,
+                    'is_completed': True,
+                    'valid': True
+                })
+            return render(request, 'queues/verify_ticket_result.html', {
+                'valid': False,
+                'error': 'Талон не найден'
+            })
+        
+        # Проверка целостности хеша
+        if not ticket.verify_hash():
+            return render(request, 'queues/verify_ticket_result.html', {
+                'ticket': ticket,
+                'valid': False,
+                'error': 'Неверный хеш талона'
+            })
+        
+        return render(request, 'queues/verify_ticket_result.html', {
+            'ticket': ticket,
+            'is_completed': False,
+            'valid': True
+        })
+    
+    except Exception as e:
+        return render(request, 'queues/verify_ticket_result.html', {
+            'valid': False,
+            'error': f'Ошибка проверки: {str(e)}'
+        })
 
 
 @login_required
