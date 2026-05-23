@@ -104,6 +104,24 @@ def queue_list(request):
 
 
 @login_required
+def dashboard(request):
+    """Личный кабинет пользователя - сводная информация"""
+    log_user_ip(request)
+    # Очереди пользователя
+    owned_queues = Queue.objects.filter(owner=request.user).annotate(
+        active_participants_count=Count('tickets', filter=Q(tickets__is_cancelled=False))
+    )
+    # Талоны пользователя в очередях других людей
+    user_tickets = Ticket.objects.filter(user=request.user, is_cancelled=False).select_related('queue')
+    
+    context = {
+        'owned_queues': owned_queues,
+        'user_tickets': user_tickets,
+    }
+    return render(request, 'queues/dashboard.html', context)
+
+
+@login_required
 def queue_create(request):
     """Создание новой очереди"""
     log_user_ip(request)
