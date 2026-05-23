@@ -15,6 +15,10 @@ urlpatterns = [
 
     # Терминалы
     path('terminals/register/', views.terminal_register, name='terminal_register'),
+    path('terminals/create/', views.create_terminal, name='create_terminal'),
+    path('terminals/<int:pk>/', views.terminal_detail, name='terminal_detail'),
+    path('terminals/<int:pk>/edit/', views.edit_terminal, name='edit_terminal'),
+    path('terminals/<int:pk>/delete/', views.delete_terminal, name='delete_terminal'),
     path('terminals/', views.terminal_list, name='terminal_list'),
     
     # API терминалов

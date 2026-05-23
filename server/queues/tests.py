@@ -529,3 +529,161 @@ class TestTerminalAPI:
         ticket = Ticket.objects.get(id=ticket_id)
         assert ticket.print_confirmed is True
         assert ticket.printed is True
+
+
+@pytest.mark.django_db
+class TestTerminalViews:
+    """Тесты для представлений терминалов"""
+    
+    def test_create_terminal_requires_login(self, client):
+        """Создание терминала требует авторизации"""
+        response = client.get(reverse('queues:create_terminal'))
+        assert response.status_code == 302
+    
+    def test_terminal_list_requires_login(self, client):
+        """Список терминалов требует авторизации"""
+        response = client.get(reverse('queues:terminal_list'))
+        assert response.status_code == 302
+    
+    def test_terminal_detail_requires_login(self, client):
+        """Детали терминала требуют авторизации"""
+        owner = User.objects.create_user(username='term_owner', password='pass123')
+        terminal = Terminal.objects.create(owner=owner, name='Test Terminal')
+        
+        response = client.get(reverse('queues:terminal_detail', kwargs={'pk': terminal.pk}))
+        assert response.status_code == 302
+    
+    def test_edit_terminal_requires_login(self, client):
+        """Редактирование терминала требует авторизации"""
+        owner = User.objects.create_user(username='edit_owner', password='pass123')
+        terminal = Terminal.objects.create(owner=owner, name='Edit Terminal')
+        
+        response = client.get(reverse('queues:edit_terminal', kwargs={'pk': terminal.pk}))
+        assert response.status_code == 302
+    
+    def test_delete_terminal_requires_login(self, client):
+        """Удаление терминала требует авторизации"""
+        owner = User.objects.create_user(username='del_owner', password='pass123')
+        terminal = Terminal.objects.create(owner=owner, name='Delete Terminal')
+        
+        response = client.get(reverse('queues:delete_terminal', kwargs={'pk': terminal.pk}))
+        assert response.status_code == 302
+    
+    def test_user_can_create_terminal(self, client):
+        """Пользователь может создать терминал"""
+        user = User.objects.create_user(username='term_creator', password='pass123')
+        client.force_login(user)
+        
+        data = {'name': 'My Terminal'}
+        response = client.post(reverse('queues:create_terminal'), data)
+        
+        assert response.status_code == 302
+        terminal = Terminal.objects.filter(owner=user, name='My Terminal').first()
+        assert terminal is not None
+        assert terminal.hash_secret is not None
+    
+    def test_user_can_view_terminal_list(self, client):
+        """Пользователь может просмотреть список своих терминалов"""
+        user = User.objects.create_user(username='term_viewer', password='pass123')
+        Terminal.objects.create(owner=user, name='Terminal 1')
+        Terminal.objects.create(owner=user, name='Terminal 2')
+        
+        client.force_login(user)
+        response = client.get(reverse('queues:terminal_list'))
+        
+        assert response.status_code == 200
+        assert len(response.context['terminals']) == 2
+    
+    def test_user_can_view_terminal_detail(self, client):
+        """Пользователь может просмотреть детали своего терминала"""
+        user = User.objects.create_user(username='detail_viewer', password='pass123')
+        terminal = Terminal.objects.create(owner=user, name='Detail Terminal')
+        
+        client.force_login(user)
+        response = client.get(reverse('queues:terminal_detail', kwargs={'pk': terminal.pk}))
+        
+        assert response.status_code == 200
+        assert response.context['terminal'] == terminal
+    
+    def test_user_cannot_view_other_terminal_detail(self, client):
+        """Пользователь не может просмотреть чужой терминал"""
+        owner = User.objects.create_user(username='other_owner', password='pass123')
+        user = User.objects.create_user(username='unauthorized', password='pass123')
+        terminal = Terminal.objects.create(owner=owner, name='Other Terminal')
+        
+        client.force_login(user)
+        response = client.get(reverse('queues:terminal_detail', kwargs={'pk': terminal.pk}))
+        
+        assert response.status_code == 404
+    
+    def test_user_can_edit_terminal(self, client):
+        """Пользователь может редактировать свой терминал"""
+        user = User.objects.create_user(username='term_editor', password='pass123')
+        terminal = Terminal.objects.create(owner=user, name='Old Name')
+        
+        client.force_login(user)
+        data = {'name': 'New Name', 'is_active': 'on'}
+        response = client.post(reverse('queues:edit_terminal', kwargs={'pk': terminal.pk}), data)
+        
+        assert response.status_code == 302
+        terminal.refresh_from_db()
+        assert terminal.name == 'New Name'
+        assert terminal.is_active is True
+    
+    def test_user_can_delete_terminal(self, client):
+        """Пользователь может удалить свой терминал"""
+        user = User.objects.create_user(username='term_deleter', password='pass123')
+        terminal = Terminal.objects.create(owner=user, name='To Delete')
+        
+        client.force_login(user)
+        response = client.post(reverse('queues:delete_terminal', kwargs={'pk': terminal.pk}))
+        
+        assert response.status_code == 302
+        assert Terminal.objects.filter(pk=terminal.pk).exists() is False
+    
+    def test_terminal_creation_without_name_fails(self, client):
+        """Создание терминала без имени невозможно"""
+        user = User.objects.create_user(username='no_name_user', password='pass123')
+        client.force_login(user)
+        
+        data = {}
+        response = client.post(reverse('queues:create_terminal'), data)
+        
+        assert response.status_code == 200
+        terminal_count = Terminal.objects.filter(owner=user).count()
+        assert terminal_count == 0
+
+
+@pytest.mark.django_db
+class TestDashboardView:
+    """Тесты для представления личного кабинета (dashboard)"""
+    
+    def test_dashboard_requires_login(self, client):
+        """Личный кабинет требует авторизации"""
+        response = client.get(reverse('queues:dashboard'))
+        assert response.status_code == 302
+    
+    def test_dashboard_shows_owned_queues(self, client):
+        """В личном кабинете отображаются очереди пользователя"""
+        user = User.objects.create_user(username='dash_user', password='pass123')
+        Queue.objects.create(owner=user, name='Queue 1')
+        Queue.objects.create(owner=user, name='Queue 2')
+        
+        client.force_login(user)
+        response = client.get(reverse('queues:dashboard'))
+        
+        assert response.status_code == 200
+        assert len(response.context['owned_queues']) == 2
+    
+    def test_dashboard_shows_user_tickets(self, client):
+        """В личном кабинете отображаются талоны пользователя"""
+        user = User.objects.create_user(username='ticket_dash_user', password='pass123')
+        owner = User.objects.create_user(username='queue_dash_owner', password='pass123')
+        queue = Queue.objects.create(owner=owner, name='Dashboard Queue')
+        Ticket.objects.create(queue=queue, user=user, number=1)
+        
+        client.force_login(user)
+        response = client.get(reverse('queues:dashboard'))
+        
+        assert response.status_code == 200
+        assert len(response.context['user_tickets']) == 1
