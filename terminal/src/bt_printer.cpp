@@ -6,12 +6,26 @@
 
 #define TAG "BT"
 
+// ─── BLE объекты ─────────────────────────────────────────────────────────────
 static NimBLEClient*                pClient    = nullptr;
 static NimBLERemoteCharacteristic*  pWriteChar = nullptr;
 static bool bleStarted = false;
 
+// Найденный UUID характеристики (для логирования)
+static char foundCharUUID[48] = {0};
+
 // =============================================================================
-//  BLE Callbacks — сигнатура зависит от версии NimBLE
+//  Список кандидатов для записи (в порядке приоритета)
+//  Добавляем все известные UUID принтеров этого класса
+// =============================================================================
+static const char* WRITE_CANDIDATES[] = {
+    "0000ffe1-0000-1000-8000-00805f9b34fb",   // FFE1 — этот принтер!
+    "0000ae01-0000-1000-8000-00805f9b34fb",   // AE01 — другие FunnyPrint
+    "5833ff02-9b8b-5191-6142-22a4536ef123",   // 5833FF02 — этот принтер (alt)
+    "6e400002-b5a3-f393-e0a9-e50e24dcca9e",   // NUS RX — Nordic UART
+    nullptr
+};
+
 // =============================================================================
 class PrinterCallbacks : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* cli) {
@@ -44,7 +58,7 @@ bool bt_write(const uint8_t* d, size_t n) {
     for (size_t off = 0; off < n; off += BLE_CHUNK_SIZE) {
         size_t chunk = min((size_t)BLE_CHUNK_SIZE, n - off);
         if (!pWriteChar->writeValue(d + off, chunk, false)) {
-            LOGE(TAG, "BLE write err at %u", off);
+            LOGE(TAG, "Write err at %u", off);
             return false;
         }
         delay(BLE_CHUNK_DELAY_MS);
@@ -66,10 +80,57 @@ static void readMac(char* buf, size_t sz) {
 }
 
 // =============================================================================
-//  Подключение к FunnyPrint (BLE)
-//
-//  Ищем характеристику AE01 во всех сервисах.
-//  Если не найдена — пробуем NUS (6E400002) как fallback.
+//  Поиск характеристики записи среди всех сервисов
+//  Пробуем все UUID из WRITE_CANDIDATES, затем первую с WRITE-свойством
+// =============================================================================
+static NimBLERemoteCharacteristic* findWriteChar(
+    const std::vector<NimBLERemoteService*>& svcList)
+{
+    // ── 1. Ищем по известным UUID ──
+    for (int ci = 0; WRITE_CANDIDATES[ci] != nullptr; ci++) {
+        NimBLEUUID uuid(WRITE_CANDIDATES[ci]);
+        for (auto* svc : svcList) {
+            auto* ch = svc->getCharacteristic(uuid);
+            if (ch) {
+                snprintf(foundCharUUID, sizeof(foundCharUUID), "%s",
+                         ch->getUUID().toString().c_str());
+                LOGI(TAG, "Found candidate [%d]: %s in SVC %s",
+                     ci, foundCharUUID,
+                     svc->getUUID().toString().c_str());
+                return ch;
+            }
+        }
+    }
+
+    // ── 2. Fallback: первая writable в не-стандартном сервисе ──
+    LOGW(TAG, "No known UUID, scanning all writable chars...");
+    for (auto* svc : svcList) {
+        // NimBLE 2.x: фильтруем стандартные GATT по строке UUID
+        // Стандартные: "0x1800", "0x1801", "0x180a" и т.д.
+        const char* svcStr = svc->getUUID().toString().c_str();
+        if (strncmp(svcStr, "0x18", 4) == 0 ||
+            strncmp(svcStr, "0x00", 4) == 0) {
+            LOGD(TAG, "Skip GATT SVC: %s", svcStr);
+            continue;
+            }
+
+        std::vector<NimBLERemoteCharacteristic*> charList =
+            svc->getCharacteristics(true);
+
+        for (auto* ch : charList) {
+            if (ch->canWrite() || ch->canWriteNoResponse()) {
+                snprintf(foundCharUUID, sizeof(foundCharUUID), "%s",
+                         ch->getUUID().toString().c_str());
+                LOGI(TAG, "Fallback: %s in SVC %s",
+                     foundCharUUID, svcStr);
+                return ch;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 // =============================================================================
 bool bt_connect() {
     char macBuf[20];
@@ -83,7 +144,6 @@ bool bt_connect() {
     LOGI(TAG, "Connecting to %s ...", macBuf);
     LOGI(TAG, "Heap: %u", ESP.getFreeHeap());
 
-    // Init NimBLE один раз
     if (!bleStarted) {
         LOGI(TAG, "Starting NimBLE...");
         NimBLEDevice::init(BT_NAME);
@@ -93,7 +153,7 @@ bool bt_connect() {
         LOGI(TAG, "NimBLE OK. Heap: %u", ESP.getFreeHeap());
     }
 
-    // Очистка предыдущего клиента
+    // Очистка
     if (pClient) {
         if (pClient->isConnected()) {
             pClient->disconnect();
@@ -105,12 +165,11 @@ bool bt_connect() {
         delay(300);
     }
 
-    // Создаём клиент
+    // ── Подключение ──
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(&bleCallbacks, false);
     pClient->setConnectTimeout(15);
 
-    // ── PUBLIC → RANDOM ──
     LOGI(TAG, "Trying PUBLIC...");
     bool connected = pClient->connect(NimBLEAddress(macBuf, BLE_ADDR_PUBLIC));
 
@@ -125,20 +184,17 @@ bool bt_connect() {
     }
 
     if (!connected) {
-        LOGE(TAG, "Connection failed!");
-        LOGE(TAG, "  Check: printer ON? MAC correct?");
+        LOGE(TAG, "Connection failed! (printer ON? correct MAC?)");
         NimBLEDevice::deleteClient(pClient);
         pClient = nullptr;
         return false;
     }
 
-    LOGI(TAG, "BLE link OK!");
+    LOGI(TAG, "BLE link OK! MTU=%u", pClient->getMTU());
     delay(500);
 
-    // ── Перечисляем сервисы ──
+    // ── Обнаружение сервисов ──
     LOGI(TAG, "Discovering services...");
-
-    // getServices() возвращает вектор по значению в некоторых версиях
     std::vector<NimBLERemoteService*> svcList = pClient->getServices(true);
 
     if (svcList.empty()) {
@@ -149,81 +205,57 @@ bool bt_connect() {
         return false;
     }
 
-    LOGI(TAG, "Found %d services:", svcList.size());
+    LOGI(TAG, "Services (%d):", svcList.size());
     for (auto* svc : svcList) {
         LOGI(TAG, "  SVC: %s", svc->getUUID().toString().c_str());
-    }
-
-    // ── Ищем характеристику AE01 ──
-    pWriteChar = nullptr;
-    NimBLEUUID targetUUID(FP_WRITE_UUID);
-
-    for (auto* svc : svcList) {
+        // Получаем характеристики для каждого сервиса
         std::vector<NimBLERemoteCharacteristic*> charList =
             svc->getCharacteristics(true);
-
         for (auto* ch : charList) {
-            LOGD(TAG, "    CHAR: %s",
-                 ch->getUUID().toString().c_str());
-
-            if (ch->getUUID().equals(targetUUID)) {
-                pWriteChar = ch;
-                LOGI(TAG, "  >>> Found AE01 in %s",
-                     svc->getUUID().toString().c_str());
-                break;
-            }
-        }
-        if (pWriteChar) break;
-    }
-
-    // ── Fallback: NUS RX ──
-    if (!pWriteChar) {
-        LOGW(TAG, "AE01 not found, trying NUS (6E400002)...");
-        NimBLEUUID nusRxUUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
-
-        for (auto* svc : svcList) {
-            std::vector<NimBLERemoteCharacteristic*> charList =
-                svc->getCharacteristics(true);
-
-            for (auto* ch : charList) {
-                if (ch->getUUID().equals(nusRxUUID)) {
-                    pWriteChar = ch;
-                    LOGI(TAG, "  >>> Found NUS RX fallback");
-                    break;
-                }
-            }
-            if (pWriteChar) break;
+            LOGI(TAG, "    CHAR: %s  W=%d WNR=%d N=%d",
+                 ch->getUUID().toString().c_str(),
+                 ch->canWrite() ? 1 : 0,
+                 ch->canWriteNoResponse() ? 1 : 0,
+                 ch->canNotify() ? 1 : 0);
         }
     }
 
+    // ── Поиск характеристики записи ──
+    pWriteChar = findWriteChar(svcList);
+
     if (!pWriteChar) {
-        LOGE(TAG, "No writable char found!");
-        LOGE(TAG, "Available characteristics:");
-        for (auto* svc : svcList) {
-            std::vector<NimBLERemoteCharacteristic*> charList =
-                svc->getCharacteristics(true);
-            for (auto* ch : charList) {
-                LOGE(TAG, "  %s in %s",
-                     ch->getUUID().toString().c_str(),
-                     svc->getUUID().toString().c_str());
-            }
-        }
+        LOGE(TAG, "No writable characteristic found!");
         pClient->disconnect();
         NimBLEDevice::deleteClient(pClient);
         pClient = nullptr;
         return false;
     }
 
-    LOGI(TAG, "Write char ready: %s",
-         pWriteChar->getUUID().toString().c_str());
+    LOGI(TAG, "Using char: %s", foundCharUUID);
+    LOGI(TAG, "  canWrite=%d canWriteNR=%d",
+         pWriteChar->canWrite() ? 1 : 0,
+         pWriteChar->canWriteNoResponse() ? 1 : 0);
+
+    // Выбираем режим записи (with/without response)
+    // Если canWrite — используем response=true для надёжности
+    // Если только canWriteNoResponse — без response
+    bool useResponse = pWriteChar->canWrite();
 
     g_printerConnected = true;
     delay(500);
-    raster_init();
+
+    // Init принтера
+    LOGI(TAG, "Sending ESC @...");
+    const uint8_t initCmd[] = {0x1B, 0x40};
+    if (!pWriteChar->writeValue(initCmd, 2, useResponse)) {
+        LOGW(TAG, "Init write failed (trying without response)");
+        pWriteChar->writeValue(initCmd, 2, false);
+    }
     delay(300);
 
     if (pClient->isConnected()) {
-        LOGI(TAG, "Printer ready! Heap: %u", ESP.getFreeHeap());
+        LOGI(TAG, "Printer READY! Char=%s Heap=%u",
+             foundCharUUID, ESP.getFreeHeap());
         return true;
     }
 
@@ -246,14 +278,12 @@ void bt_disconnect() {
 }
 
 // =============================================================================
-//  Протокол FunnyPrint
-//
-//  Строка растра: заголовок [12 2A 01 01] + 48 байт данных
-//  Каждый бит = 1 пиксель (MSB слева, 1 = чёрный)
+//  Отправка строки растра
+//  Принтер использует сервис FFE6/FFE1 — протокол аналогичен AE01:
+//    заголовок [12 2A 01 01] + 48 байт данных
 // =============================================================================
-
 static bool sendRasterLine(const uint8_t* lineData) {
-    uint8_t hdr[] = {0x12, 0x2A, 0x01, 0x01};
+    const uint8_t hdr[] = {0x12, 0x2A, 0x01, 0x01};
     if (!bt_write(hdr, sizeof(hdr))) return false;
     if (!bt_write(lineData, PRINTER_WIDTH_BYTES)) return false;
     delay(BLE_LINE_DELAY_MS);
@@ -274,7 +304,7 @@ void raster_set_concentration(uint8_t level) {
     if (level < 1) level = 1;
     if (level > 6) level = 6;
     LOGD(TAG, "Concentration %d", level);
-    uint8_t cmd[] = {0x1F, 0x11, 0x02, level};
+    const uint8_t cmd[] = {0x1F, 0x11, 0x02, level};
     bt_write(cmd, 4);
     delay(50);
 }
@@ -298,7 +328,6 @@ void raster_empty(int heightPx) {
 void raster_separator(char style, uint8_t heightPx) {
     if (!g_printerConnected) return;
     uint8_t line[PRINTER_WIDTH_BYTES];
-
     for (int y = 0; y < heightPx; y++) {
         memset(line, 0, sizeof(line));
         for (int x = 0; x < PRINTER_WIDTH_PX; x++) {
