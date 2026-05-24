@@ -53,7 +53,7 @@
 //  Константы
 // =============================================================================
 #define FW_VERSION           "3.1.0"
-#define DEFAULT_PRINTER_NAME "MTP-2"   // BLE-имя по умолчанию
+#define DEFAULT_PRINTER_NAME "GT01"   // BLE-имя по умолчанию
 #define POLL_INTERVAL_MS     5000UL
 #define PRINT_WIDTH          384       // px; MTP-2=384, MTP-3=576
 
