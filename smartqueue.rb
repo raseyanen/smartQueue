@@ -3,7 +3,7 @@ class Smartqueue < Formula
   homepage "https://github.com/raseyanen/smartqueue"
   url "https://github.com/raseyanen/smartqueue/archive/refs/tags/v1.0.1.tar.gz"
   sha256 "0a0c59547e4cd7d25bbf2121a89dba3bdd7cd911888fa30626397577cd2d3c3d"
-  version "1.0.0"
+  version "1.0.1"
 
   depends_on "docker"
   depends_on "docker-compose"
