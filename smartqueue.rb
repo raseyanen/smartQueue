@@ -2,7 +2,7 @@ class Smartqueue < Formula
   desc "Smart Queue Management System - Docker-based Django app"
   homepage "https://github.com/raseyanen/smartqueue"
   url "https://github.com/raseyanen/smartqueue/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "ВСТАВЬ_ХЕШ"
+  sha256 "9cfa0c9d234a0b94c303f6224903e37b72e9510326785f57471b8afd2b834a56"
   version "1.0.0"
 
   depends_on "docker"
