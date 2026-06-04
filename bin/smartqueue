@@ -2,107 +2,52 @@
 # Homebrew-обёртка для SmartQueue
 
 SMARTQUEUE_DIR="$HOME/.smartqueue"
-COMPOSE_FILE="$SMARTQUEUE_DIR/docker-compose.prod.yml"
-ENV_FILE="$SMARTQUEUE_DIR/.env"
+# ПРАВИЛЬНЫЙ ПУТЬ К ФАЙЛАМ В CELLAR
+HOMEBREW_CELLAR="/opt/homebrew/Cellar/smartqueue/1.0.1"
 
 case "$1" in
   start)
     echo "🚀 Starting SmartQueue..."
-    
-    # Создаём директорию
     mkdir -p "$SMARTQUEUE_DIR"
     
-    # Копируем docker-compose.yml если его нет
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo "📄 Copying docker-compose.prod.yml..."
-        if [ -f "$HOMEBREW_PREFIX/opt/smartqueue/docker-compose.prod.yml" ]; then
-            cp "$HOMEBREW_PREFIX/opt/smartqueue/docker-compose.prod.yml" "$COMPOSE_FILE"
-        else
-            echo "❌ Error: docker-compose.prod.yml not found in Homebrew cellar"
-            echo "   Try: brew reinstall smartqueue"
-            exit 1
-        fi
+    # Копируем из правильного места
+    if [ ! -f "$SMARTQUEUE_DIR/docker-compose.prod.yml" ]; then
+        cp "$HOMEBREW_CELLAR/docker-compose.prod.yml" "$SMARTQUEUE_DIR/"
     fi
     
-    # Копируем .env.example если нет .env
-    if [ ! -f "$ENV_FILE" ]; then
-        echo "🔧 Creating .env file from example..."
-        if [ -f "$HOMEBREW_PREFIX/opt/smartqueue/.env.example" ]; then
-            cp "$HOMEBREW_PREFIX/opt/smartqueue/.env.example" "$ENV_FILE"
-            echo "⚠️  Please edit $ENV_FILE and set your passwords:"
-            echo "   - DB_PASSWORD"
-            echo "   - SECRET_KEY"
-            echo ""
-            echo "   Then run 'smartqueue start' again"
-            exit 1
-        else
-            echo "❌ Error: .env.example not found in Homebrew cellar"
-            exit 1
-        fi
-    fi
-    
-    # Проверяем, что файлы на месте
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        echo "❌ Error: docker-compose.prod.yml is missing in $SMARTQUEUE_DIR"
+    if [ ! -f "$SMARTQUEUE_DIR/.env" ]; then
+        cp "$HOMEBREW_CELLAR/.env.example" "$SMARTQUEUE_DIR/.env"
+        echo "⚠️  Please edit $SMARTQUEUE_DIR/.env and set your passwords"
+        echo "   Then run 'smartqueue start' again"
         exit 1
     fi
     
-    # Запускаем
-    echo "🐳 Running docker-compose..."
     cd "$SMARTQUEUE_DIR"
-    docker-compose -f "$COMPOSE_FILE" up -d
-    
-    if [ $? -eq 0 ]; then
-        echo "✅ SmartQueue started at http://localhost:8000"
-    else
-        echo "❌ Failed to start containers"
-        exit 1
-    fi
+    docker-compose up -d
+    echo "✅ SmartQueue started at http://localhost:8000"
     ;;
     
   stop)
-    echo "🛑 Stopping SmartQueue..."
-    if [ -f "$COMPOSE_FILE" ]; then
-        cd "$SMARTQUEUE_DIR"
-        docker-compose -f "$COMPOSE_FILE" down
-        echo "✅ Stopped"
-    else
-        echo "⚠️  No compose file found. Nothing to stop."
-    fi
+    cd "$SMARTQUEUE_DIR"
+    docker-compose down
+    echo "✅ Stopped"
     ;;
     
   logs)
-    if [ -f "$COMPOSE_FILE" ]; then
-        cd "$SMARTQUEUE_DIR"
-        docker-compose -f "$COMPOSE_FILE" logs -f
-    else
-        echo "❌ No compose file found. Run 'smartqueue start' first."
-    fi
+    cd "$SMARTQUEUE_DIR"
+    docker-compose logs -f
     ;;
     
   restart)
-    $0 stop
-    sleep 2
-    $0 start
+    $0 stop && $0 start
     ;;
     
   status)
-    if [ -f "$COMPOSE_FILE" ]; then
-        cd "$SMARTQUEUE_DIR"
-        docker-compose -f "$COMPOSE_FILE" ps
-    else
-        echo "⚠️  Not initialized. Run 'smartqueue start' first."
-    fi
+    cd "$SMARTQUEUE_DIR"
+    docker-compose ps
     ;;
     
   *)
     echo "Usage: smartqueue {start|stop|restart|logs|status}"
-    echo ""
-    echo "Commands:"
-    echo "  start    - Start all services"
-    echo "  stop     - Stop all services"
-    echo "  restart  - Restart all services"
-    echo "  logs     - View logs"
-    echo "  status   - Show container status"
     ;;
 esac
