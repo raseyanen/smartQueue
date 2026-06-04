@@ -1,0 +1,67 @@
+#!/bin/bash
+# Homebrew-обёртка для запуска SmartQueue через Docker Compose
+
+SMARTQUEUE_DIR="$HOME/.smartqueue"
+COMPOSE_FILE="$SMARTQUEUE_DIR/docker-compose.prod.yml"
+ENV_FILE="$SMARTQUEUE_DIR/.env"
+
+case "$1" in
+  start)
+    echo "🚀 Starting SmartQueue..."
+
+    # Создаём директорию если нет
+    mkdir -p "$SMARTQUEUE_DIR"
+
+    # Копируем docker-compose.yml если его нет
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        cp "$HOMEBREW_PREFIX/opt/smartqueue/docker-compose.prod.yml" "$COMPOSE_FILE"
+    fi
+
+    # Копируем .env.example если нет .env
+    if [ ! -f "$ENV_FILE" ]; then
+        cp "$HOMEBREW_PREFIX/opt/smartqueue/.env.example" "$ENV_FILE"
+        echo "⚠️  Please edit $ENV_FILE and set your passwords"
+        echo "   After that, run 'smartqueue start' again"
+        exit 1
+    fi
+
+    # Запускаем
+    cd "$SMARTQUEUE_DIR"
+    docker-compose up -d
+
+    echo "✅ SmartQueue started at http://localhost:8000"
+    ;;
+
+  stop)
+    echo "🛑 Stopping SmartQueue..."
+    cd "$SMARTQUEUE_DIR"
+    docker-compose down
+    echo "✅ Stopped"
+    ;;
+
+  logs)
+    cd "$SMARTQUEUE_DIR"
+    docker-compose logs -f
+    ;;
+
+  restart)
+    $0 stop
+    $0 start
+    ;;
+
+  status)
+    cd "$SMARTQUEUE_DIR"
+    docker-compose ps
+    ;;
+
+  *)
+    echo "Usage: smartqueue {start|stop|restart|logs|status}"
+    echo ""
+    echo "Commands:"
+    echo "  start    - Start all services"
+    echo "  stop     - Stop all services"
+    echo "  restart  - Restart all services"
+    echo "  logs     - View logs"
+    echo "  status   - Show container status"
+    ;;
+esac
