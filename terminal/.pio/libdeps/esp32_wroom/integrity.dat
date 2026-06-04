@@ -1,0 +1,10 @@
+gyverlibs/Stamp
+gyverlibs/GTL
+gyverlibs/StreamIO
+gyverlibs/GyverDB
+gyverlibs/StringUtils
+gyverlibs/FileData
+gyverlibs/GyverHTTP
+gyverlibs/BSON
+gyverlibs/Settings
+h2zero/NimBLE-Arduino
