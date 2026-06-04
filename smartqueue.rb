@@ -9,24 +9,18 @@ class Smartqueue < Formula
   depends_on "docker-compose"
 
   def install
-    # Находим bin/smartqueue где угодно внутри архива
-    script = Dir["**/bin/smartqueue"].first
-    bin.install script if script
-    
-    compose = Dir["**/docker-compose.prod.yml"].first
-    prefix.install compose if compose
-    
-    env = Dir["**/.env.example"].first
-    prefix.install env if env
+    bin.install "bin/smartqueue"
+    prefix.install "docker-compose.prod.yml"
+    prefix.install ".env.example"
   end
 
   def caveats
     <<~EOS
-      First, edit your environment file:
-        nano #{opt_prefix}/.env.example
-      
-      Then start the service:
-        smartqueue start
+      First time setup:
+        1. Edit your environment file:
+           nano #{opt_prefix}/.env.example
+        2. Then run:
+           smartqueue start
     EOS
   end
 end
