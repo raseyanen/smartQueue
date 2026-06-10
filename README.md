@@ -60,6 +60,19 @@ smartQueue/
 - Docker и Docker Compose
 - Python 3.11+ (для локальной разработки)
 
+### Docker hub
+```bash
+docker pull moodroow/smartqueue
+docker run moodroow/smartqueue
+```
+
+### Homebrew
+```bash
+brew tap raseyanen/smartqueue
+brew install smartqueue
+smartqueue start
+```
+
 ### Запуск сервера
 
 ```bash
