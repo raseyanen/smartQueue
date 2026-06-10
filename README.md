@@ -62,8 +62,8 @@ smartQueue/
 
 ### Docker hub
 ```bash
-docker pull moodroow/smartqueue
-docker run moodroow/smartqueue
+docker pull moodroow/smartqueue:latest
+docker run moodroow/smartqueue:latest
 ```
 
 ### Homebrew
