@@ -1,0 +1,90 @@
+# .github/workflows/update-homebrew.yml
+name: Update Homebrew Formula
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'server/**'           # Запускается только при изменениях в серверной части
+      - 'Dockerfile'          # или если меняется Dockerfile
+      - 'docker-compose.prod.yml'
+  workflow_dispatch:          # Можно запустить вручную
+
+jobs:
+  update-formula:
+    runs-on: ubuntu-latest
+    if: github.repository == 'raseyanen/smartqueue'  # Чтобы не запускалось в форках
+    
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+        with:
+          path: smartqueue
+          fetch-depth: 0
+      
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: raseyanen/homebrew-smartqueue
+          path: homebrew-smartqueue
+          token: ${{ secrets.HOMEBREW_TOKEN }}
+      
+      - name: Get version and SHA
+        id: meta
+        run: |
+          cd smartqueue
+          # Берем последний коммит как версию
+          VERSION=$(git rev-parse --short HEAD)
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          
+          # Собираем архив локально и считаем хеш
+          cd ..
+          tar -czf smartqueue.tar.gz smartqueue/
+          SHA256=$(shasum -a 256 smartqueue.tar.gz | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> $GITHUB_OUTPUT
+      
+      - name: Update formula
+        run: |
+          cd homebrew-smartqueue
+          
+          # Обновляем формулу
+          cat > Formula/smartqueue.rb << 'EOF'
+          # Maintainer: raseyanen
+          class Smartqueue < Formula
+            desc "Smart Queue Management System - Docker-based Django app"
+            homepage "https://github.com/raseyanen/smartqueue"
+            url "https://github.com/raseyanen/smartqueue/archive/$VERSION.tar.gz"
+            sha256 "$SHA256"
+            version "$VERSION"
+          
+            depends_on "docker"
+            depends_on "docker-compose"
+          
+            def install
+              bin.install "bin/smartqueue"
+              prefix.install "docker-compose.prod.yml"
+              prefix.install ".env.example"
+            end
+          
+            def caveats
+              <<~EOS
+                First time setup:
+                  1. Edit your environment file:
+                     nano #{opt_prefix}/.env.example
+                  2. Then run:
+                     smartqueue start
+              EOS
+            end
+          end
+          EOF
+          
+          # Подставляем переменные
+          sed -i "s/\$VERSION/${{ steps.meta.outputs.VERSION }}/g" Formula/smartqueue.rb
+          sed -i "s/\$SHA256/${{ steps.meta.outputs.SHA256 }}/g" Formula/smartqueue.rb
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add Formula/smartqueue.rb
+          git commit -m "Update formula to version ${{ steps.meta.outputs.VERSION }}" || echo "No changes"
+          git push
