@@ -10,16 +10,28 @@ case "$1" in
     echo "🚀 Starting SmartQueue..."
     mkdir -p "$SMARTQUEUE_DIR"
     
-    # Копируем из правильного места
-    if [ ! -f "$SMARTQUEUE_DIR/docker-compose.prod.yml" ]; then
-        cp "$HOMEBREW_CELLAR/docker-compose.prod.yml" "$SMARTQUEUE_DIR/"
+    # Копируем и ПЕРЕИМЕНОВЫВАЕМ в docker-compose.yml
+    if [ ! -f "$SMARTQUEUE_DIR/docker-compose.yml" ]; then
+        if [ -f "$HOMEBREW_CELLAR/docker-compose.prod.yml" ]; then
+            cp "$HOMEBREW_CELLAR/docker-compose.prod.yml" "$SMARTQUEUE_DIR/docker-compose.yml"
+            echo "✓ Copied docker-compose.yml"
+        else
+            echo "❌ Error: docker-compose.prod.yml not found in $HOMEBREW_CELLAR"
+            exit 1
+        fi
     fi
     
     if [ ! -f "$SMARTQUEUE_DIR/.env" ]; then
-        cp "$HOMEBREW_CELLAR/.env.example" "$SMARTQUEUE_DIR/.env"
-        echo "⚠️  Please edit $SMARTQUEUE_DIR/.env and set your passwords"
-        echo "   Then run 'smartqueue start' again"
-        exit 1
+        if [ -f "$HOMEBREW_CELLAR/.env.example" ]; then
+            cp "$HOMEBREW_CELLAR/.env.example" "$SMARTQUEUE_DIR/.env"
+            echo "✓ Created .env file"
+            echo "⚠️  Please edit $SMARTQUEUE_DIR/.env and set your passwords"
+            echo "   Then run 'smartqueue start' again"
+            exit 1
+        else
+            echo "❌ Error: .env.example not found in $HOMEBREW_CELLAR"
+            exit 1
+        fi
     fi
     
     cd "$SMARTQUEUE_DIR"
@@ -28,14 +40,12 @@ case "$1" in
     ;;
     
   stop)
-    cd "$SMARTQUEUE_DIR"
-    docker-compose down
+    cd "$SMARTQUEUE_DIR" 2>/dev/null && docker-compose down 2>/dev/null
     echo "✅ Stopped"
     ;;
     
   logs)
-    cd "$SMARTQUEUE_DIR"
-    docker-compose logs -f
+    cd "$SMARTQUEUE_DIR" 2>/dev/null && docker-compose logs -f || echo "❌ Not initialized. Run 'smartqueue start' first."
     ;;
     
   restart)
@@ -43,11 +53,17 @@ case "$1" in
     ;;
     
   status)
-    cd "$SMARTQUEUE_DIR"
-    docker-compose ps
+    cd "$SMARTQUEUE_DIR" 2>/dev/null && docker-compose ps 2>/dev/null || echo "⚠️  Not running or not initialized"
     ;;
     
   *)
     echo "Usage: smartqueue {start|stop|restart|logs|status}"
+    echo ""
+    echo "Commands:"
+    echo "  start    - Start all services"
+    echo "  stop     - Stop all services"
+    echo "  restart  - Restart all services"
+    echo "  logs     - View logs"
+    echo "  status   - Show container status"
     ;;
 esac
