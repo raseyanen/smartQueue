@@ -6,15 +6,16 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'server/**'           # Запускается только при изменениях в серверной части
-      - 'Dockerfile'          # или если меняется Dockerfile
+      - 'server/**'
+      - 'Dockerfile'
       - 'docker-compose.prod.yml'
-  workflow_dispatch:          # Можно запустить вручную
+      - 'bin/smartqueue'
+  workflow_dispatch:
 
 jobs:
   update-formula:
     runs-on: ubuntu-latest
-    if: github.repository == 'raseyanen/smartqueue'  # Чтобы не запускалось в форках
+    if: github.repository == 'raseyanen/smartqueue'
     
     steps:
       - name: Checkout main repo
@@ -38,11 +39,16 @@ jobs:
           VERSION=$(git rev-parse --short HEAD)
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           
-          # Собираем архив локально и считаем хеш
+          # Скачиваем архив С ГИТХАБА (не локальный!)
           cd ..
-          tar -czf smartqueue.tar.gz smartqueue/
+          curl -L -o smartqueue.tar.gz "https://github.com/raseyanen/smartqueue/archive/$VERSION.tar.gz"
+          
+          # Считаем хеш скачанного архива
           SHA256=$(shasum -a 256 smartqueue.tar.gz | cut -d' ' -f1)
           echo "SHA256=$SHA256" >> $GITHUB_OUTPUT
+          
+          echo "Version: $VERSION"
+          echo "SHA256: $SHA256"
       
       - name: Update formula
         run: |
@@ -54,9 +60,9 @@ jobs:
           class Smartqueue < Formula
             desc "Smart Queue Management System - Docker-based Django app"
             homepage "https://github.com/raseyanen/smartqueue"
-            url "https://github.com/raseyanen/smartqueue/archive/$VERSION.tar.gz"
-            sha256 "$SHA256"
-            version "$VERSION"
+            url "https://github.com/raseyanen/smartqueue/archive/VERSION_PLACEHOLDER.tar.gz"
+            sha256 "SHA256_PLACEHOLDER"
+            version "VERSION_PLACEHOLDER"
           
             depends_on "docker"
             depends_on "docker-compose"
@@ -80,8 +86,8 @@ jobs:
           EOF
           
           # Подставляем переменные
-          sed -i "s/\$VERSION/${{ steps.meta.outputs.VERSION }}/g" Formula/smartqueue.rb
-          sed -i "s/\$SHA256/${{ steps.meta.outputs.SHA256 }}/g" Formula/smartqueue.rb
+          sed -i "s/VERSION_PLACEHOLDER/${{ steps.meta.outputs.VERSION }}/g" Formula/smartqueue.rb
+          sed -i "s/SHA256_PLACEHOLDER/${{ steps.meta.outputs.SHA256 }}/g" Formula/smartqueue.rb
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
