@@ -1,8 +1,0 @@
-POST 127.0.0.1:8000/queues/api/terminal/ticket/
-Content-Type: application/json
-X-Terminal-Hash: 7ae9471aa186d15f4271b56d105e72c46aec5d61654dc852454dcecf16e385be
-
-{
-  "link": "http://127.0.0.1:8000/queues/c99df3ca/",
-  "ip_address": "127.0.0.1"
-}
