@@ -2,21 +2,32 @@
 # Homebrew-обёртка для SmartQueue
 
 SMARTQUEUE_DIR="$HOME/.smartqueue"
-# ПРАВИЛЬНЫЙ ПУТЬ К ФАЙЛАМ В CELLAR
-HOMEBREW_CELLAR="/opt/homebrew/Cellar/smartqueue/1.0.1"
+
+# Автоматически находим актуальную версию в Cellar
+CELLAR_BASE="/opt/homebrew/Cellar/smartqueue"
+if [ -d "$CELLAR_BASE" ]; then
+    # Берем последнюю установленную версию (сортировка по времени)
+    VERSION=$(ls -t "$CELLAR_BASE" | head -1)
+    HOMEBREW_CELLAR="$CELLAR_BASE/$VERSION"
+else
+    echo "❌ Error: SmartQueue not installed in Homebrew Cellar"
+    exit 1
+fi
 
 case "$1" in
   start)
     echo "🚀 Starting SmartQueue..."
+    echo "📁 Using version: $VERSION"
     mkdir -p "$SMARTQUEUE_DIR"
     
-    # Копируем и ПЕРЕИМЕНОВЫВАЕМ в docker-compose.yml
+    # Копируем docker-compose.yml
     if [ ! -f "$SMARTQUEUE_DIR/docker-compose.yml" ]; then
         if [ -f "$HOMEBREW_CELLAR/docker-compose.prod.yml" ]; then
             cp "$HOMEBREW_CELLAR/docker-compose.prod.yml" "$SMARTQUEUE_DIR/docker-compose.yml"
             echo "✓ Copied docker-compose.yml"
         else
             echo "❌ Error: docker-compose.prod.yml not found in $HOMEBREW_CELLAR"
+            ls -la "$HOMEBREW_CELLAR"
             exit 1
         fi
     fi
