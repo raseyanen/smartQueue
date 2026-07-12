@@ -27,7 +27,7 @@ jobs:
         with:
           context: ./server
           push: true
-          platforms: linux/amd64,linux/arm64  # ← ГЛАВНОЕ ДОБАВЛЕНИЕ
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/smartqueue:latest
             ${{ secrets.DOCKER_USERNAME }}/smartqueue:${{ github.sha }}
