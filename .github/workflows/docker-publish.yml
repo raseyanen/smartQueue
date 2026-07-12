@@ -22,11 +22,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
-      - name: Build and push web image
+      - name: Build and push multi-arch image
         uses: docker/build-push-action@v5
         with:
           context: ./server
           push: true
+          platforms: linux/amd64,linux/arm64  # ← ГЛАВНОЕ ДОБАВЛЕНИЕ
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/smartqueue:latest
             ${{ secrets.DOCKER_USERNAME }}/smartqueue:${{ github.sha }}
